@@ -39,9 +39,28 @@
         font-weight: bold;
         color: #555;
       }
-      #timeline {
+      .zone {
         max-width: 640px;
-        margin: 40px auto 0;
+        margin: 30px auto;
+        padding: 20px;
+        border: 1px solid #ccc;
+        border-radius: 8px;
+        background: #fafafa;
+      }
+      .zone h2 {
+        margin: 0 0 15px;
+        font-size: 18px;
+        color: #333;
+        border-bottom: 2px solid #007bff;
+        padding-bottom: 8px;
+      }
+      #connection {
+        text-align: center;
+      }
+      #manual {
+        text-align: center;
+      }
+      #timeline {
       }
       #timeline button {
         padding: 8px 16px;
@@ -112,22 +131,29 @@
   <body>
     <h1>ESP32 WebBLE Trigger</h1>
 
-    <button id="connectBtn" class="connect">1. Connect to ESP32</button>
-    <br />
-    <button id="onBtn" class="on" disabled>Trigger: ON</button>
-    <button id="offBtn" class="off" disabled>Trigger: OFF</button>
+    <div id="connection" class="zone">
+      <h2>Connection</h2>
+      <button id="connectBtn" class="connect">Connect to ESP32</button>
+      <div id="status">Status: Disconnected</div>
+    </div>
 
-    <div id="anims"></div>
+    <div id="manual" class="zone">
+      <h2>Manual</h2>
+      <div>
+        <button id="onBtn" class="on" disabled>Trigger: ON</button>
+        <button id="offBtn" class="off" disabled>Trigger: OFF</button>
+      </div>
+      <div id="anims" style="margin: 15px 0"></div>
+      <div>
+        <input type="color" name="fill" id="fill" value="#007800" onchange="changeFill(event)" disabled />
+        <label>
+          Fade (ms):
+          <input type="number" id="fade" value="500" min="0" step="100" style="width: 70px" />
+        </label>
+      </div>
+    </div>
 
-    <input type="color" name="fill" id="fill" value="#007800" onchange="changeFill(event)" disabled />
-    <label>
-      Fade (ms):
-      <input type="number" id="fade" value="500" min="0" step="100" style="width: 70px" />
-    </label>
-
-    <div id="status">Status: Disconnected</div>
-
-    <div id="timeline">
+    <div id="timeline" class="zone">
       <h2>Timeline</h2>
       <label>
         Length (s):
@@ -135,7 +161,7 @@
       </label>
       <button id="tlPlay" disabled>Play</button>
       <button id="tlStop" disabled>Stop</button>
-      <label><input type="checkbox" id="tlLoop" checked /> Loop</label>
+      <label><input type="checkbox" id="tlLoop" /> Loop</label>
 
       <div id="tlBar"><div id="tlHead"></div></div>
       <p class="hint">
@@ -144,6 +170,7 @@
         animation.
       </p>
       <div id="tlKeys"></div>
+    </div>
     </div>
 
     <script>
@@ -455,9 +482,10 @@
 
       renderTimeline(); // show the pinned start/end keyframes right away
 
-      // A pass begins by snapping to the start keyframe's color, so the first
-      // segment fades from exactly where the gradient says it should
+      // A pass begins by turning on the light, snapping to the start keyframe's
+      // color, so the first segment fades from exactly where the gradient says it should
       function startPass() {
+        sendValue(1);
         tlNext = 0;
         sendFill(keyframes[0].color, 0);
       }
