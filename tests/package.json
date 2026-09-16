@@ -1,0 +1,11 @@
+{
+  "name": "bled-tests",
+  "private": true,
+  "description": "Headless tests for index.html (jsdom + fake Web Bluetooth) and a JS port of the firmware's color code",
+  "scripts": {
+    "test": "node page.test.js && node color.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^26.0.0"
+  }
+}
