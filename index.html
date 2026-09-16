@@ -1,0 +1,163 @@
+<!doctype html>
+<html>
+  <head>
+    <title>ESP32 WebBLE Control</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        text-align: center;
+        padding: 50px;
+        background: #f4f4f9;
+      }
+      button {
+        padding: 15px 25px;
+        font-size: 18px;
+        cursor: pointer;
+        border-radius: 8px;
+        border: none;
+        margin: 10px;
+        transition: 0.3s;
+      }
+      .connect {
+        background: #007bff;
+        color: white;
+      }
+      .on {
+        background: #28a745;
+        color: white;
+      }
+      .off {
+        background: #dc3545;
+        color: white;
+      }
+      button:disabled {
+        background: #ccc;
+        cursor: not-allowed;
+      }
+      #status {
+        margin-top: 20px;
+        font-weight: bold;
+        color: #555;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>ESP32 WebBLE Trigger</h1>
+
+    <button id="connectBtn" class="connect">1. Connect to ESP32</button>
+    <br />
+    <button id="onBtn" class="on" disabled>Trigger: ON</button>
+    <button id="offBtn" class="off" disabled>Trigger: OFF</button>
+
+    <div id="anims"></div>
+
+    <input type="color" name="fill" id="fill" onchange="changeFill(event)" disabled />
+
+    <div id="status">Status: Disconnected</div>
+
+    <script>
+      // Use the same UUIDs as the ESP32 code
+      const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+      const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+
+      const animations = ["solid", "chaser", "noise", "sin"];
+
+      let device;
+      let server;
+      let service;
+      let characteristic;
+      let fillCharacteristic;
+      let animCharacteristic;
+
+      const connectBtn = document.getElementById("connectBtn");
+      const onBtn = document.getElementById("onBtn");
+      const offBtn = document.getElementById("offBtn");
+      const statusMsg = document.getElementById("status");
+
+      connectBtn.addEventListener("click", async () => {
+        try {
+          statusMsg.innerText = "Scanning...";
+          device = await navigator.bluetooth.requestDevice({
+            filters: [{ name: "ESP32_BLE_Trigger" }],
+            optionalServices: [SERVICE_UUID],
+          });
+
+          statusMsg.innerText = "Connecting to GATT Server...";
+          server = await device.gatt.connect();
+
+          statusMsg.innerText = "Getting Service...";
+          service = await server.getPrimaryService(SERVICE_UUID);
+
+          statusMsg.innerText = "Getting Characteristic...";
+          characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
+          fillCharacteristic = await service.getCharacteristic(
+            "154f969f-5195-4552-9aba-85922a7ba713",
+          );
+          animCharacteristic = await service.getCharacteristic(
+            "4a9163c8-45ae-42a9-a7d7-e26485ca83e7",
+          );
+
+          statusMsg.innerText = "Connected!";
+          setControlsEnabled(true);
+
+          device.addEventListener("gattserverdisconnected", () => {
+            statusMsg.innerText = "Disconnected";
+            setControlsEnabled(false);
+          });
+        } catch (error) {
+          console.log(error);
+          statusMsg.innerText = "Error: " + error;
+        }
+      });
+
+      for (let i = 0; i < animations.length; i++) {
+        document
+          .querySelector("#anims")
+          .insertAdjacentHTML(
+            "beforeend",
+            `<button onclick="sendAnim(${i})" disabled>${animations[i]}</button>`,
+          );
+      }
+
+      // Enable/disable every control that needs an active connection
+      function setControlsEnabled(enabled) {
+        onBtn.disabled = !enabled;
+        offBtn.disabled = !enabled;
+        document.getElementById("fill").disabled = !enabled;
+        document
+          .querySelectorAll("#anims button")
+          .forEach((btn) => (btn.disabled = !enabled));
+        connectBtn.disabled = enabled;
+      }
+
+      async function sendValue(val) {
+        if (characteristic) {
+          const data = new Uint8Array([val]);
+          await characteristic.writeValue(data);
+          console.log("Sent: " + val);
+        }
+      }
+
+      async function changeFill(ev) {
+        const color = ev.target.value;
+
+        const r = parseInt(color.substr(1, 2), 16);
+        const g = parseInt(color.substr(3, 2), 16);
+        const b = parseInt(color.substr(5, 2), 16);
+
+        if (fillCharacteristic) {
+          await fillCharacteristic.writeValue(new Uint8Array([r, g, b]));
+        }
+      }
+
+      async function sendAnim(animIndex) {
+        if (animCharacteristic) {
+          await animCharacteristic.writeValue(new Uint8Array([animIndex]));
+        }
+      }
+
+      onBtn.addEventListener("click", () => sendValue(1));
+      offBtn.addEventListener("click", () => sendValue(0));
+    </script>
+  </body>
+</html>
