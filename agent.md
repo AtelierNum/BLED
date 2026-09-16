@@ -52,7 +52,9 @@ All characteristics are `READ | WRITE`. The page only writes to them and never r
 - It only works in **Chromium and Google Chrome**, on a secure context (`https://` or `localhost`). Web Bluetooth needs a user gesture, so the connection has to start from the "Connect" button click.
 - The page is plain vanilla JS with no framework and no bundler. Keep it that way unless asked otherwise.
 - Only one client can connect to the ESP32 at a time.
-- The UI state follows the connection: `setControlsEnabled(enabled)` turns on the on/off buttons, the color picker and the animation buttons after connecting, and turns them off again on `gattserverdisconnected`. Any new control that writes to a characteristic should be added there, and its write function should check that the characteristic exists first.
+- The UI state follows the connection: `setControlsEnabled(enabled)` turns on the on/off buttons, the color picker, the animation buttons and the timeline Play button after connecting, and turns them off again on `gattserverdisconnected`. Any new control that writes to a characteristic should be added there.
+- **All BLE writes go through `queueWrite(char, bytes)`.** Web Bluetooth rejects a write while another is in flight, so writes are chained one after the other. `queueWrite` also no-ops when the characteristic is `undefined`, so callers don't need their own guard.
+- **Timeline:** `keyframes` is an array of `{ id, time, anim, color }` (`color` is `"#rrggbb"`). Playing it (`playTimeline` / `tickTimeline`, driven by `requestAnimationFrame`) calls `sendFill(color)` then `sendAnim(anim)` when each keyframe's time is reached, so the ESP32 receives two small writes per keyframe and renders the animation itself; nothing is streamed. `tlLength` (seconds) is set by the "Length" input via `setTimelineLength`, which clamps existing keyframes to the new end. Keyframes are added by clicking the bar (they take the main color picker's current value) and edited in the rows rendered by `renderTimeline`.
 
 ## Running
 

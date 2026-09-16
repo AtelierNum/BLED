@@ -147,6 +147,12 @@ void loop() {
   Serial.print(ledOn);
   Serial.print("\t");
   Serial.print(animation);
+  Serial.print("\t");
+  Serial.print(r);
+  Serial.print("\t");
+  Serial.print(g);
+  Serial.print("\t");
+  Serial.print(b);
   Serial.println();
 
 

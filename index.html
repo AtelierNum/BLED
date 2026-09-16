@@ -39,6 +39,61 @@
         font-weight: bold;
         color: #555;
       }
+      #timeline {
+        max-width: 640px;
+        margin: 40px auto 0;
+      }
+      #timeline button {
+        padding: 8px 16px;
+        font-size: 15px;
+      }
+      #tlBar {
+        position: relative;
+        height: 40px;
+        margin: 15px 0 5px;
+        background: #ddd;
+        border-radius: 6px;
+        cursor: crosshair;
+        overflow: hidden;
+      }
+      .tlMark {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 4px;
+        margin-left: -2px;
+        background: #007bff;
+        pointer-events: none;
+      }
+      #tlHead {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        width: 2px;
+        margin-left: -1px;
+        background: #dc3545;
+        pointer-events: none;
+      }
+      .hint {
+        margin: 0 0 10px;
+        font-size: 13px;
+        color: #888;
+      }
+      .tlKey {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        margin: 4px 0;
+      }
+      .tlKey input[type="number"] {
+        width: 70px;
+      }
+      .tlKey button {
+        padding: 4px 10px;
+        font-size: 13px;
+        margin: 0;
+      }
     </style>
   </head>
   <body>
@@ -54,6 +109,21 @@
     <input type="color" name="fill" id="fill" onchange="changeFill(event)" disabled />
 
     <div id="status">Status: Disconnected</div>
+
+    <div id="timeline">
+      <h2>Timeline</h2>
+      <label>
+        Length (s):
+        <input type="number" id="tlLength" value="10" min="1" step="1" />
+      </label>
+      <button id="tlPlay" disabled>Play</button>
+      <button id="tlStop" disabled>Stop</button>
+      <label><input type="checkbox" id="tlLoop" checked /> Loop</label>
+
+      <div id="tlBar"><div id="tlHead"></div></div>
+      <p class="hint">Click the bar to add a keyframe</p>
+      <div id="tlKeys"></div>
+    </div>
 
     <script>
       // Use the same UUIDs as the ESP32 code
@@ -121,40 +191,197 @@
 
       // Enable/disable every control that needs an active connection
       function setControlsEnabled(enabled) {
+        if (!enabled) stopTimeline();
         onBtn.disabled = !enabled;
         offBtn.disabled = !enabled;
         document.getElementById("fill").disabled = !enabled;
         document
           .querySelectorAll("#anims button")
           .forEach((btn) => (btn.disabled = !enabled));
+        tlPlayBtn.disabled = !enabled;
         connectBtn.disabled = enabled;
       }
 
-      async function sendValue(val) {
-        if (characteristic) {
-          const data = new Uint8Array([val]);
-          await characteristic.writeValue(data);
-          console.log("Sent: " + val);
-        }
+      // Web Bluetooth rejects a write while another is in flight,
+      // so every write goes through this chain, one after the other
+      let writeChain = Promise.resolve();
+      function queueWrite(char, bytes) {
+        if (!char) return;
+        writeChain = writeChain
+          .then(() => char.writeValue(new Uint8Array(bytes)))
+          .catch((err) => console.log(err));
       }
 
-      async function changeFill(ev) {
-        const color = ev.target.value;
-
-        const r = parseInt(color.substr(1, 2), 16);
-        const g = parseInt(color.substr(3, 2), 16);
-        const b = parseInt(color.substr(5, 2), 16);
-
-        if (fillCharacteristic) {
-          await fillCharacteristic.writeValue(new Uint8Array([r, g, b]));
-        }
+      function sendValue(val) {
+        queueWrite(characteristic, [val]);
+        console.log("Sent: " + val);
       }
 
-      async function sendAnim(animIndex) {
-        if (animCharacteristic) {
-          await animCharacteristic.writeValue(new Uint8Array([animIndex]));
-        }
+      // "#rrggbb" -> [r, g, b]
+      function hexToRgb(color) {
+        return [
+          parseInt(color.substr(1, 2), 16),
+          parseInt(color.substr(3, 2), 16),
+          parseInt(color.substr(5, 2), 16),
+        ];
       }
+
+      function sendFill(color) {
+        queueWrite(fillCharacteristic, hexToRgb(color));
+      }
+
+      function changeFill(ev) {
+        sendFill(ev.target.value);
+      }
+
+      function sendAnim(animIndex) {
+        queueWrite(animCharacteristic, [animIndex]);
+      }
+
+      // --- TIMELINE ---
+      // A keyframe is a color + animation call scheduled at a time (in seconds).
+      // The ESP32 renders the animation itself; we only tell it when to switch.
+      let keyframes = []; // { id, time, anim, color: "#rrggbb" }
+      let nextKeyId = 0;
+      let tlLength = 10; // seconds
+
+      let tlPlaying = false;
+      let tlStart = 0; // performance.now() when the current pass started
+      let tlNext = 0; // index of the next keyframe to fire (keyframes sorted)
+      let tlRaf = null;
+
+      const tlLengthInput = document.getElementById("tlLength");
+      const tlPlayBtn = document.getElementById("tlPlay");
+      const tlStopBtn = document.getElementById("tlStop");
+      const tlLoop = document.getElementById("tlLoop");
+      const tlBar = document.getElementById("tlBar");
+      const tlHead = document.getElementById("tlHead");
+      const tlKeys = document.getElementById("tlKeys");
+
+      function sortKeyframes() {
+        keyframes.sort((a, b) => a.time - b.time);
+      }
+
+      function renderTimeline() {
+        sortKeyframes();
+
+        // Markers on the bar
+        tlBar.querySelectorAll(".tlMark").forEach((m) => m.remove());
+        for (const k of keyframes) {
+          tlBar.insertAdjacentHTML(
+            "beforeend",
+            `<div class="tlMark" style="left:${(k.time / tlLength) * 100}%; background:${k.color}" title="${k.time}s ${animations[k.anim]} ${k.color}"></div>`,
+          );
+        }
+
+        // One editable row per keyframe
+        tlKeys.innerHTML = keyframes
+          .map(
+            (k) => `<div class="tlKey">
+              <input type="number" min="0" max="${tlLength}" step="0.1" value="${k.time}"
+                onchange="updateKeyframe(${k.id}, 'time', this.value)" /> s
+              <input type="color" value="${k.color}"
+                onchange="updateKeyframe(${k.id}, 'color', this.value)" />
+              <select onchange="updateKeyframe(${k.id}, 'anim', this.value)">
+                ${animations.map((name, i) => `<option value="${i}" ${i === k.anim ? "selected" : ""}>${name}</option>`).join("")}
+              </select>
+              <button onclick="removeKeyframe(${k.id})">✕</button>
+            </div>`,
+          )
+          .join("");
+      }
+
+      // New keyframes take the color currently shown in the main picker
+      function addKeyframe(time, anim = 0) {
+        const color = document.getElementById("fill").value;
+        keyframes.push({ id: nextKeyId++, time, anim, color });
+        renderTimeline();
+      }
+
+      function updateKeyframe(id, field, value) {
+        const k = keyframes.find((k) => k.id === id);
+        if (!k) return;
+        if (field === "time") {
+          k.time = Math.min(tlLength, Math.max(0, parseFloat(value) || 0));
+        } else if (field === "anim") {
+          k.anim = parseInt(value);
+        } else if (field === "color") {
+          k.color = value;
+        }
+        renderTimeline();
+      }
+
+      function removeKeyframe(id) {
+        keyframes = keyframes.filter((k) => k.id !== id);
+        renderTimeline();
+      }
+
+      function setTimelineLength(seconds) {
+        tlLength = Math.max(1, parseFloat(seconds) || 1);
+        tlLengthInput.value = tlLength;
+        // Keyframes past the new end are pulled back onto it
+        for (const k of keyframes) k.time = Math.min(k.time, tlLength);
+        renderTimeline();
+      }
+
+      // Click on the bar -> new keyframe at that time
+      tlBar.addEventListener("click", (ev) => {
+        const rect = tlBar.getBoundingClientRect();
+        const t = ((ev.clientX - rect.left) / rect.width) * tlLength;
+        addKeyframe(Math.round(t * 10) / 10);
+      });
+
+      tlLengthInput.addEventListener("change", (ev) =>
+        setTimelineLength(ev.target.value),
+      );
+
+      function playTimeline() {
+        sortKeyframes();
+        tlPlaying = true;
+        tlStart = performance.now();
+        tlNext = 0;
+        tlPlayBtn.disabled = true;
+        tlStopBtn.disabled = false;
+        tlRaf = requestAnimationFrame(tickTimeline);
+      }
+
+      function stopTimeline() {
+        if (!tlPlaying) return;
+        tlPlaying = false;
+        cancelAnimationFrame(tlRaf);
+        tlHead.style.left = "0%";
+        tlPlayBtn.disabled = !animCharacteristic;
+        tlStopBtn.disabled = true;
+      }
+
+      function tickTimeline(now) {
+        if (!tlPlaying) return;
+        let elapsed = (now - tlStart) / 1000;
+
+        // Fire every keyframe whose time has passed: color first, then animation
+        while (tlNext < keyframes.length && keyframes[tlNext].time <= elapsed) {
+          sendFill(keyframes[tlNext].color);
+          sendAnim(keyframes[tlNext].anim);
+          tlNext++;
+        }
+
+        if (elapsed >= tlLength) {
+          if (tlLoop.checked) {
+            tlStart += tlLength * 1000;
+            tlNext = 0;
+            elapsed -= tlLength;
+          } else {
+            stopTimeline();
+            return;
+          }
+        }
+
+        tlHead.style.left = `${(elapsed / tlLength) * 100}%`;
+        tlRaf = requestAnimationFrame(tickTimeline);
+      }
+
+      tlPlayBtn.addEventListener("click", playTimeline);
+      tlStopBtn.addEventListener("click", stopTimeline);
 
       onBtn.addEventListener("click", () => sendValue(1));
       offBtn.addEventListener("click", () => sendValue(0));
