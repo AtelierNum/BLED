@@ -141,7 +141,12 @@ class fillCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
 
-    // Payload: [pin, r, g, b] or [pin, r, g, b, durationHi, durationLo] (ms)
+    // Payload:
+    //   [pin, r, g, b]                                      snap to the color
+    //   [pin, r, g, b, durationHi, durationLo]              fade from the current color (ms)
+    //   [pin, r, g, b, durationHi, durationLo, r0, g0, b0]  fade from r0/g0/b0
+    // The timeline uses the last form: each segment says where its fade starts,
+    // so BLE delays can't leave it starting from a slightly-off color.
     if (value.length() < 4 || !isStripPin((uint8_t)value[0])) return;
     uint8_t pin = (uint8_t)value[0];
     HSV target = rgbToHsv((uint8_t)value[1], (uint8_t)value[2], (uint8_t)value[3]);
@@ -149,16 +154,42 @@ class fillCallbacks : public BLECharacteristicCallbacks {
     if (value.length() >= 6) {
       duration = ((uint8_t)value[4] << 8) | (uint8_t)value[5];
     }
+    bool hasStart = value.length() >= 9;
+    HSV start;
+    if (hasStart) {
+      start = rgbToHsv((uint8_t)value[6], (uint8_t)value[7], (uint8_t)value[8]);
+    }
 
     portENTER_CRITICAL(&stateMux);
     PinState &st = pinStates[pin];
-    st.startHSV = st.currentHSV;  // fade from wherever we are now
+    if (hasStart) {
+      st.startHSV = start;
+    } else {
+      // Fade from wherever we are now. Bring the fade up to date first:
+      // loop() only updates currentHSV when it draws, so after a command that
+      // just arrived it could still be stale.
+      updateColorTransition(st);
+      st.startHSV = st.currentHSV;
+    }
     st.targetHSV = target;
 
-    // Black, white and grey have no hue of their own: borrow it from the
-    // other end so fading to/from them doesn't sweep through the rainbow
-    if (st.targetHSV.s == 0 || st.targetHSV.v == 0) st.targetHSV.h = st.startHSV.h;
-    if (st.startHSV.s == 0 || st.startHSV.v == 0) st.startHSV.h = st.targetHSV.h;
+    // Borrow what a color doesn't really have from the other end:
+    // - black has no hue or saturation, so fading to/from black only changes
+    //   brightness (instead of washing out through grey/white)
+    // - white and grey have no hue, so fading to/from them doesn't sweep
+    //   through the rainbow
+    if (st.targetHSV.v == 0) {
+      st.targetHSV.h = st.startHSV.h;
+      st.targetHSV.s = st.startHSV.s;
+    } else if (st.targetHSV.s == 0) {
+      st.targetHSV.h = st.startHSV.h;
+    }
+    if (st.startHSV.v == 0) {
+      st.startHSV.h = st.targetHSV.h;
+      st.startHSV.s = st.targetHSV.s;
+    } else if (st.startHSV.s == 0) {
+      st.startHSV.h = st.targetHSV.h;
+    }
 
     // Shortest way around the hue circle
     st.hueDelta = (int32_t)st.targetHSV.h - (int32_t)st.startHSV.h;

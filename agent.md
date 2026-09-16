@@ -6,7 +6,7 @@ Guidance for AI coding agents working in this repository.
 
 **ESP32 WebBLE** (the page is titled "BLED") is a small ateliernum template that lets a webpage control an ESP32 over Bluetooth Low Energy using the [Web Bluetooth API](https://caniuse.com/web-bluetooth). The page drives **up to 6 NeoPixel strips**. For each strip it can turn it on or off, set a fill color with a fade, pick an animation, and play a keyframe timeline. The page decides which strips exist: the pin and LED count for each strip are set in the page, not in the firmware.
 
-There's no build system, no package manager and no tests. The repo has two independent parts that talk to each other only over BLE:
+There's no build system and no package manager for the template itself. Optional headless tests live in `tests/` (see [Running](#running)). The template has two independent parts that talk to each other only over BLE:
 
 | Path | Role |
 | --- | --- |
@@ -26,7 +26,7 @@ The page and the firmware each hard-code the same identifiers. **If you change a
 | Characteristic | UUID | Payload | Firmware handler |
 | --- | --- | --- | --- |
 | Power (on/off) | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | `[pin, 1 = on \| 0 = off]` | `powerCallbacks` → `pinStates[pin].on` |
-| Fill color | `154f969f-5195-4552-9aba-85922a7ba713` | `[pin, r, g, b]` or `[pin, r, g, b, durHi, durLo]` (fade duration in ms, big-endian uint16; omitted = instant) | `fillCallbacks` → `pinStates[pin]` transition fields |
+| Fill color | `154f969f-5195-4552-9aba-85922a7ba713` | `[pin, r, g, b]` (snap), `[pin, r, g, b, durHi, durLo]` (fade from the current color; duration in ms, big-endian uint16), or `[pin, r, g, b, durHi, durLo, r0, g0, b0]` (fade from `r0/g0/b0`) | `fillCallbacks` → `pinStates[pin]` transition fields |
 | Animation | `4a9163c8-45ae-42a9-a7d7-e26485ca83e7` | `[pin, animation index]` | `animationCallbacks` → `pinStates[pin].animation` |
 | Strips | `d3c6f0a2-5e1b-4f7a-9c38-2b7e4a1d9f60` | `[pin, countHi, countLo]` once per strip, in list order | `stripsCallbacks` → `pendingConfig`, applied in `loop()` |
 
@@ -56,9 +56,14 @@ All characteristics are `READ | WRITE`. The page only writes to them and never r
   - for each strip, locks, calls `updateColorTransition(pinStates[pin])`, copies the state, unlocks, then `renderStrip(pixels, state)`,
   - calls `printStatus()`, which logs every strip's `GPIO on animation r g b` to Serial (115200 baud) every 250 ms.
 - **Colors are transitions, interpolated in HSV.**
-  - A fill write converts the RGB target with `rgbToHsv` into `targetHSV` and captures `startHSV` from `currentHSV`. A new target mid-fade therefore starts from where the pixels are.
+  - A fill write converts the RGB target with `rgbToHsv` into `targetHSV`. The fade's start depends on the payload:
+    - **With a start color** (9-byte payload), `startHSV` is that color. The timeline always sends this form, so every segment starts exactly on its keyframe, even when BLE delays cut the previous fade short.
+    - **Without one**, the firmware calls `updateColorTransition` to bring the current fade up to date, then captures `startHSV` from `currentHSV`, so the fade starts from where the pixels are. The update step matters: `loop()` only refreshes `currentHSV` when it draws, so right after another command it could be stale.
   - Hue takes the shortest arc (`hueDelta`, signed).
-  - If either endpoint is black or grey (`s == 0 || v == 0`), it borrows the other endpoint's hue, so the fade doesn't sweep through the rainbow.
+  - Endpoints borrow what they don't really have from the other end:
+    - **black** (`v == 0`) borrows hue **and** saturation, so fading to or from black only changes brightness instead of washing out through grey or white;
+    - **white or grey** (`s == 0`) borrows hue, so the fade doesn't sweep through the rainbow.
+  - The page's `mixColors` mirrors these rules exactly; keep the two in sync.
   - `updateColorTransition` lerps H, S and V and rebuilds `currentColor` via `Adafruit_NeoPixel::ColorHSV`.
   - Animations should only ever read `r/g/b` (copied from `currentColor`), never the HSV state.
 - **Explicit prototypes:** `rgbToHsv`, `updateColorTransition` and `renderStrip` use the `HSV` / `PinState` structs, so they have explicit prototypes after the struct definitions. Don't remove them: Arduino's auto-generated prototypes could land above the structs, and the sketch would stop compiling.
@@ -91,22 +96,27 @@ All characteristics are `READ | WRITE`. The page only writes to them and never r
 - **Timeline (per strip):**
   - **Keyframes:** `strip.tl.keyframes` is an array of `{ id, time, anim, color, fixed? }`, where `color` is `"#rrggbb"`. A keyframe's color is the color **at** that time.
   - **Segments:** the segment between keyframes *i* and *i+1* runs `keyframes[i].anim` while fading from `keyframes[i].color` to `keyframes[i+1].color`.
-  - **Drawing:** each track's bar (`#bar-<id>`) draws every segment as a `linear-gradient(to right in hsl shorter hue, …)` rectangle (`.tlSeg`), with a marker (`.tlMark`) at every keyframe.
-  - **Preview color:** `colorAt(strip, time)` interpolates in HSV with the same shortest-arc and hue-borrowing rules as the firmware, so the preview matches the strip.
+  - **Drawing:** each track's bar (`#bar-<id>`) draws every segment as a rectangle (`.tlSeg`), with a marker (`.tlMark`) at every keyframe. CSS can't interpolate in HSV, so each segment's `linear-gradient` is made of 13 stops sampled from `mixColors`.
+  - **Preview color:** `mixColors(a, b, t)` reproduces the firmware's fade (HSV, shortest hue arc, black borrows hue and saturation, white/grey borrow hue), and `colorAt(strip, time)` uses it. The bar therefore shows exactly the colors the strip fades through.
   - **Pinned keyframes:** two always exist, `fixed: "start"` at 0 s and `fixed: "end"` at `tl.length`. They can be recolored but not moved or removed. `setTrackLength` keeps the end one on the new length. The end keyframe has no animation control, since no segment follows it.
   - **New keyframes** take `colorAt(time)`, so inserting one doesn't change the output.
   - **Playback:** tracks play independently, and a single `requestAnimationFrame` loop (`tick`) advances every playing track (`tickTrack`).
     - `playTrack(id, now)` always plays from the start, so pressing Play on a track that's already playing restarts it. Play stays enabled while playing.
     - "Play all" (`playAllTracks`) calls `playTrack` for every strip with one shared `now`, so all tracks (re)start on the same instant.
-    - Each pass starts with `startPass(strip)`: power on, then snap to the start color.
-    - When segment *i* begins, the page sends `sendFill(strip, keyframes[i+1].color, segmentDuration)` and `sendAnim(strip, keyframes[i].anim)`. The ESP32 renders the animation and the fade itself; nothing is streamed.
+    - Each pass starts with `startPass(strip)`, which only powers the strip on. The first segment carries the start color.
+    - When segment *i* begins, the page sends `sendFill(strip, keyframes[i+1].color, segmentDuration, keyframes[i].color)` and `sendAnim(strip, keyframes[i].anim)`. That's two writes per segment. The ESP32 renders the animation and the fade itself; nothing is streamed.
     - At the end, the track loops if `tl.loop` is set, otherwise it stops.
 
 ## Running
 
 - **Web:** serve `index.html` with any static server, for example `npx serve` or `python -m http.server`, or host it on GitHub Pages. Then open it in Chrome.
 - **Firmware:** open `ESP32_webBLE/ESP32_webBLE.ino` in Arduino IDE with the ESP32 board package and the Adafruit NeoPixel library installed, then upload it to the board.
-- There are no automated tests. To check a change, flash the board, connect from the page and watch the Serial Monitor. Page logic can also be exercised headlessly with jsdom and a fake `navigator.bluetooth` that records the bytes written to each characteristic.
+- **Tests** (`tests/`, Node + jsdom, no browser or board needed). Run `npm test` from `tests/`. It has two files:
+  - `page.test.js` loads `index.html` with a fake `navigator.bluetooth` that records every byte written to each characteristic. It then drives the UI (strip list, manual tabs, timelines, Play / Play all) and checks the exact payloads.
+  - `color.test.js` records the fill writes the page sends while playing a timeline and delivers them 20–60 ms late, like real BLE. It replays them through a **JS port of the firmware's color code** (`fillCallbacks`, `updateColorTransition`, `rgbToHsv`, `ColorHSV`) and checks the pixel colors frame by frame: exact green/black/magenta thirds, and fades through black that don't wash out. **If you change the firmware's color logic, update the port too**, or this test no longer means anything.
+  - The repo lives in a Google Drive-synced folder, so avoid `npm install` inside it (`node_modules` would sync). Install jsdom somewhere outside the repo and point Node at it instead, e.g. `$env:NODE_PATH = "<dir>\node_modules"; node page.test.js; node color.test.js`.
+  - After changing a test's expectations, check that the test still fails on the bug it guards (for example, temporarily revert the fix).
+- On hardware: flash the board, connect from the page and watch the Serial Monitor. The tests don't cover the firmware's BLE, threading or NeoPixel output, only its color math.
 
 ## Known quirks
 
