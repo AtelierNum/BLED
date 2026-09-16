@@ -56,14 +56,27 @@
         cursor: crosshair;
         overflow: hidden;
       }
+      .tlSeg {
+        position: absolute;
+        top: 0;
+        bottom: 0;
+        pointer-events: none;
+      }
       .tlMark {
         position: absolute;
         top: 0;
         bottom: 0;
-        width: 4px;
-        margin-left: -2px;
-        background: #007bff;
+        width: 3px;
+        margin-left: -1.5px;
+        background: #fff;
+        box-shadow: 0 0 0 1px #333;
         pointer-events: none;
+      }
+      .tlKey .fixed {
+        display: inline-block;
+        width: 70px;
+        font-size: 13px;
+        color: #888;
       }
       #tlHead {
         position: absolute;
@@ -106,7 +119,11 @@
 
     <div id="anims"></div>
 
-    <input type="color" name="fill" id="fill" onchange="changeFill(event)" disabled />
+    <input type="color" name="fill" id="fill" value="#007800" onchange="changeFill(event)" disabled />
+    <label>
+      Fade (ms):
+      <input type="number" id="fade" value="500" min="0" step="100" style="width: 70px" />
+    </label>
 
     <div id="status">Status: Disconnected</div>
 
@@ -121,7 +138,11 @@
       <label><input type="checkbox" id="tlLoop" checked /> Loop</label>
 
       <div id="tlBar"><div id="tlHead"></div></div>
-      <p class="hint">Click the bar to add a keyframe</p>
+      <p class="hint">
+        Click the bar to add a keyframe. Each keyframe holds the color at that
+        moment; the segment after it fades to the next color while running its
+        animation.
+      </p>
       <div id="tlKeys"></div>
     </div>
 
@@ -226,12 +247,16 @@
         ];
       }
 
-      function sendFill(color) {
-        queueWrite(fillCharacteristic, hexToRgb(color));
+      // Sends a target color and how long (ms) the ESP32 should take to fade
+      // to it. Payload: [r, g, b, durationHi, durationLo]
+      function sendFill(color, durationMs = 0) {
+        const d = Math.min(65535, Math.max(0, Math.round(durationMs)));
+        queueWrite(fillCharacteristic, [...hexToRgb(color), d >> 8, d & 0xff]);
       }
 
       function changeFill(ev) {
-        sendFill(ev.target.value);
+        const fade = parseInt(document.getElementById("fade").value) || 0;
+        sendFill(ev.target.value, fade);
       }
 
       function sendAnim(animIndex) {
@@ -239,11 +264,18 @@
       }
 
       // --- TIMELINE ---
-      // A keyframe is a color + animation call scheduled at a time (in seconds).
-      // The ESP32 renders the animation itself; we only tell it when to switch.
-      let keyframes = []; // { id, time, anim, color: "#rrggbb" }
-      let nextKeyId = 0;
+      // A keyframe holds the color AT a given time (in seconds). The segment
+      // between two keyframes runs the first one's animation while the ESP32
+      // fades from the first color to the second; we only tell it when to switch.
+      // The first and last keyframes are pinned to the start and end of the
+      // timeline: they can't be removed or moved, only recolored.
       let tlLength = 10; // seconds
+      let nextKeyId = 0;
+      let keyframes = [
+        // { id, time, anim, color: "#rrggbb", fixed?: "start" | "end" }
+        { id: nextKeyId++, time: 0, anim: 0, color: "#007800", fixed: "start" },
+        { id: nextKeyId++, time: tlLength, anim: 0, color: "#007800", fixed: "end" },
+      ];
 
       let tlPlaying = false;
       let tlStart = 0; // performance.now() when the current pass started
@@ -258,42 +290,125 @@
       const tlHead = document.getElementById("tlHead");
       const tlKeys = document.getElementById("tlKeys");
 
+      // Sort by time, with the pinned start/end keyframes always at the ends
       function sortKeyframes() {
-        keyframes.sort((a, b) => a.time - b.time);
+        const rank = (k) => (k.fixed === "start" ? -1 : k.fixed === "end" ? 1 : 0);
+        keyframes.sort((a, b) => a.time - b.time || rank(a) - rank(b));
+      }
+
+      // [r, g, b] 0..255 -> [h 0..360, s 0..1, v 0..1]
+      function rgbToHsv([r, g, b]) {
+        r /= 255; g /= 255; b /= 255;
+        const mx = Math.max(r, g, b);
+        const mn = Math.min(r, g, b);
+        const d = mx - mn;
+        let h = 0;
+        if (d > 0) {
+          if (mx === r) h = ((g - b) / d + 6) % 6;
+          else if (mx === g) h = (b - r) / d + 2;
+          else h = (r - g) / d + 4;
+          h *= 60;
+        }
+        return [h, mx === 0 ? 0 : d / mx, mx];
+      }
+
+      function hsvToHex([h, s, v]) {
+        const f = (n) => {
+          const k = (n + h / 60) % 6;
+          return v - v * s * Math.max(0, Math.min(k, 4 - k, 1));
+        };
+        return (
+          "#" +
+          [f(5), f(3), f(1)]
+            .map((x) => Math.round(x * 255).toString(16).padStart(2, "0"))
+            .join("")
+        );
+      }
+
+      // Color the strip would show at `time`. Mirrors the ESP32: HSV, shortest
+      // hue arc, and grey/black endpoints borrow the other end's hue
+      function colorAt(time) {
+        sortKeyframes();
+        let i = 0;
+        while (i < keyframes.length - 2 && keyframes[i + 1].time <= time) i++;
+        const a = keyframes[i];
+        const b = keyframes[i + 1];
+        const span = b.time - a.time;
+        const t = span > 0 ? Math.min(1, Math.max(0, (time - a.time) / span)) : 0;
+
+        const ha = rgbToHsv(hexToRgb(a.color));
+        const hb = rgbToHsv(hexToRgb(b.color));
+        if (hb[1] === 0 || hb[2] === 0) hb[0] = ha[0];
+        if (ha[1] === 0 || ha[2] === 0) ha[0] = hb[0];
+        let dh = hb[0] - ha[0];
+        if (dh > 180) dh -= 360;
+        if (dh < -180) dh += 360;
+
+        return hsvToHex([
+          (ha[0] + dh * t + 360) % 360,
+          ha[1] + (hb[1] - ha[1]) * t,
+          ha[2] + (hb[2] - ha[2]) * t,
+        ]);
       }
 
       function renderTimeline() {
         sortKeyframes();
 
-        // Markers on the bar
-        tlBar.querySelectorAll(".tlMark").forEach((m) => m.remove());
-        for (const k of keyframes) {
+        tlBar.querySelectorAll(".tlSeg, .tlMark").forEach((m) => m.remove());
+        const pct = (t) => (t / tlLength) * 100;
+
+        // One gradient rectangle per segment, drawn behind the playhead.
+        // "in hsl shorter hue" makes the preview sweep hue the way the ESP32
+        // does (CSS has no HSV, but the hue path is the same)
+        for (let i = 0; i < keyframes.length - 1; i++) {
+          const a = keyframes[i];
+          const b = keyframes[i + 1];
           tlBar.insertAdjacentHTML(
-            "beforeend",
-            `<div class="tlMark" style="left:${(k.time / tlLength) * 100}%; background:${k.color}" title="${k.time}s ${animations[k.anim]} ${k.color}"></div>`,
+            "afterbegin",
+            `<div class="tlSeg" style="left:${pct(a.time)}%; width:${pct(b.time - a.time)}%;
+              background: linear-gradient(to right in hsl shorter hue, ${a.color}, ${b.color})"
+              title="${a.time}s → ${b.time}s: ${animations[a.anim]}"></div>`,
           );
         }
 
-        // One editable row per keyframe
+        // Keyframe markers on top
+        for (const k of keyframes) {
+          tlBar.insertAdjacentHTML(
+            "beforeend",
+            `<div class="tlMark" style="left:${pct(k.time)}%" title="${k.time}s ${k.color}"></div>`,
+          );
+        }
+
+        // One editable row per keyframe. Pinned ones can't be moved or removed,
+        // and the end keyframe has no animation since nothing runs after it.
         tlKeys.innerHTML = keyframes
           .map(
             (k) => `<div class="tlKey">
-              <input type="number" min="0" max="${tlLength}" step="0.1" value="${k.time}"
-                onchange="updateKeyframe(${k.id}, 'time', this.value)" /> s
+              ${
+                k.fixed
+                  ? `<span class="fixed">${k.fixed} (${k.time}s)</span>`
+                  : `<input type="number" min="0" max="${tlLength}" step="0.1" value="${k.time}"
+                      onchange="updateKeyframe(${k.id}, 'time', this.value)" /> s`
+              }
               <input type="color" value="${k.color}"
                 onchange="updateKeyframe(${k.id}, 'color', this.value)" />
-              <select onchange="updateKeyframe(${k.id}, 'anim', this.value)">
-                ${animations.map((name, i) => `<option value="${i}" ${i === k.anim ? "selected" : ""}>${name}</option>`).join("")}
-              </select>
-              <button onclick="removeKeyframe(${k.id})">✕</button>
+              ${
+                k.fixed === "end"
+                  ? ""
+                  : `<select onchange="updateKeyframe(${k.id}, 'anim', this.value)">
+                      ${animations.map((name, i) => `<option value="${i}" ${i === k.anim ? "selected" : ""}>${name}</option>`).join("")}
+                    </select>`
+              }
+              ${k.fixed ? "" : `<button onclick="removeKeyframe(${k.id})">✕</button>`}
             </div>`,
           )
           .join("");
       }
 
-      // New keyframes take the color currently shown in the main picker
+      // New keyframes take the color the gradient already has at that time,
+      // so adding one doesn't change what the strip does until you edit it
       function addKeyframe(time, anim = 0) {
-        const color = document.getElementById("fill").value;
+        const color = colorAt(time);
         keyframes.push({ id: nextKeyId++, time, anim, color });
         renderTimeline();
       }
@@ -302,6 +417,7 @@
         const k = keyframes.find((k) => k.id === id);
         if (!k) return;
         if (field === "time") {
+          if (k.fixed) return;
           k.time = Math.min(tlLength, Math.max(0, parseFloat(value) || 0));
         } else if (field === "anim") {
           k.anim = parseInt(value);
@@ -312,15 +428,17 @@
       }
 
       function removeKeyframe(id) {
-        keyframes = keyframes.filter((k) => k.id !== id);
+        keyframes = keyframes.filter((k) => k.id !== id || k.fixed);
         renderTimeline();
       }
 
       function setTimelineLength(seconds) {
         tlLength = Math.max(1, parseFloat(seconds) || 1);
         tlLengthInput.value = tlLength;
-        // Keyframes past the new end are pulled back onto it
-        for (const k of keyframes) k.time = Math.min(k.time, tlLength);
+        // The end keyframe follows the new length; anything past it is pulled back
+        for (const k of keyframes) {
+          k.time = k.fixed === "end" ? tlLength : Math.min(k.time, tlLength);
+        }
         renderTimeline();
       }
 
@@ -335,11 +453,20 @@
         setTimelineLength(ev.target.value),
       );
 
+      renderTimeline(); // show the pinned start/end keyframes right away
+
+      // A pass begins by snapping to the start keyframe's color, so the first
+      // segment fades from exactly where the gradient says it should
+      function startPass() {
+        tlNext = 0;
+        sendFill(keyframes[0].color, 0);
+      }
+
       function playTimeline() {
         sortKeyframes();
         tlPlaying = true;
         tlStart = performance.now();
-        tlNext = 0;
+        startPass();
         tlPlayBtn.disabled = true;
         tlStopBtn.disabled = false;
         tlRaf = requestAnimationFrame(tickTimeline);
@@ -358,17 +485,21 @@
         if (!tlPlaying) return;
         let elapsed = (now - tlStart) / 1000;
 
-        // Fire every keyframe whose time has passed: color first, then animation
-        while (tlNext < keyframes.length && keyframes[tlNext].time <= elapsed) {
-          sendFill(keyframes[tlNext].color);
-          sendAnim(keyframes[tlNext].anim);
+        // Fire every segment whose start has passed: tell the ESP32 to fade to
+        // the NEXT keyframe's color over the segment, running this one's animation.
+        // The end keyframe starts no segment, so it never fires.
+        while (tlNext < keyframes.length - 1 && keyframes[tlNext].time <= elapsed) {
+          const k = keyframes[tlNext];
+          const next = keyframes[tlNext + 1];
+          sendFill(next.color, (next.time - k.time) * 1000);
+          sendAnim(k.anim);
           tlNext++;
         }
 
         if (elapsed >= tlLength) {
           if (tlLoop.checked) {
             tlStart += tlLength * 1000;
-            tlNext = 0;
+            startPass();
             elapsed -= tlLength;
           } else {
             stopTimeline();

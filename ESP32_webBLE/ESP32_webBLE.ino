@@ -15,9 +15,28 @@ const int ledPin = 2;  // Onboard LED
 const unsigned int numpixels = 64;
 Adafruit_NeoPixel pixels(numpixels, 27, NEO_GRB + NEO_KHZ800);
 
-uint8_t r = 0;
-uint8_t g = 120;
-uint8_t b = 0;
+// --- COLOR TRANSITION ---
+// The page sends a target color and a duration. currentColor (what the
+// pixels actually show) fades from startHSV to targetHSV over that time,
+// so every animation doubles as a transition.
+// The fade runs in HSV rather than RGB so a hue change stays saturated
+// (red -> green sweeps through yellow instead of dimming through olive).
+struct HSV {
+  uint16_t h;  // 0..65535, wraps (same scale as Adafruit_NeoPixel::ColorHSV)
+  uint8_t s;   // 0..255
+  uint8_t v;   // 0..255
+};
+// Explicit prototype: Arduino would otherwise auto-generate one above the
+// struct definition and fail to compile
+HSV rgbToHsv(uint8_t r, uint8_t g, uint8_t b);
+
+uint8_t currentColor[3] = { 0, 120, 0 };
+HSV currentHSV = { 21845, 255, 120 };  // green, matches currentColor
+HSV startHSV = currentHSV;
+HSV targetHSV = currentHSV;
+int32_t hueDelta = 0;                  // signed shortest-arc distance start -> target
+unsigned long transitionStart = 0;     // millis() when the fade began
+unsigned long transitionDuration = 0;  // ms, 0 = snap to target
 
 typedef enum {
   SOLID,
@@ -74,10 +93,26 @@ class fillCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
 
+    // Payload: [r, g, b] or [r, g, b, durationHi, durationLo] (ms)
     if (value.length() >= 3) {
-      r = (uint8_t)value[0];
-      g = (uint8_t)value[1];
-      b = (uint8_t)value[2];
+      startHSV = currentHSV;  // fade from wherever we are now
+      targetHSV = rgbToHsv((uint8_t)value[0], (uint8_t)value[1], (uint8_t)value[2]);
+
+      // Black, white and grey have no hue of their own: borrow it from the
+      // other end so fading to/from them doesn't sweep through the rainbow
+      if (targetHSV.s == 0 || targetHSV.v == 0) targetHSV.h = startHSV.h;
+      if (startHSV.s == 0 || startHSV.v == 0) startHSV.h = targetHSV.h;
+
+      // Shortest way around the hue circle
+      hueDelta = (int32_t)targetHSV.h - (int32_t)startHSV.h;
+      if (hueDelta > 32768) hueDelta -= 65536;
+      if (hueDelta < -32768) hueDelta += 65536;
+
+      transitionDuration = 0;
+      if (value.length() >= 5) {
+        transitionDuration = ((uint8_t)value[3] << 8) | (uint8_t)value[4];
+      }
+      transitionStart = millis();
     }
   }
 };
@@ -144,6 +179,12 @@ void setup() {
 }
 
 void loop() {
+  updateColorTransition();
+  // The animations below read r/g/b, which is always the current (faded) color
+  uint8_t r = currentColor[0];
+  uint8_t g = currentColor[1];
+  uint8_t b = currentColor[2];
+
   Serial.print(ledOn);
   Serial.print("\t");
   Serial.print(animation);
@@ -211,6 +252,54 @@ void loop() {
   pixels.show();
 
   delay(16);  // Small delay to prevent watchdog issues
+}
+
+// Moves currentHSV along the startHSV -> targetHSV fade and rebuilds currentColor
+void updateColorTransition() {
+  float t = 1.0f;
+  if (transitionDuration > 0) {
+    t = (float)(millis() - transitionStart) / (float)transitionDuration;
+    if (t > 1.0f) t = 1.0f;
+  }
+
+  currentHSV.h = (uint16_t)((int32_t)startHSV.h + (int32_t)(hueDelta * t));  // wraps naturally
+  currentHSV.s = (uint8_t)llerp(startHSV.s, targetHSV.s, t);
+  currentHSV.v = (uint8_t)llerp(startHSV.v, targetHSV.v, t);
+
+  // ColorHSV packs 0x00RRGGBB; no gamma here, the animations apply their own
+  uint32_t c = pixels.ColorHSV(currentHSV.h, currentHSV.s, currentHSV.v);
+  currentColor[0] = (c >> 16) & 0xFF;
+  currentColor[1] = (c >> 8) & 0xFF;
+  currentColor[2] = c & 0xFF;
+}
+
+// RGB (0..255) -> HSV with hue on the 0..65535 scale ColorHSV expects
+HSV rgbToHsv(uint8_t r, uint8_t g, uint8_t b) {
+  HSV out;
+  uint8_t mx = max(r, max(g, b));
+  uint8_t mn = min(r, min(g, b));
+  uint8_t delta = mx - mn;
+
+  out.v = mx;
+  out.s = (mx == 0) ? 0 : (uint8_t)((255UL * delta) / mx);
+
+  if (delta == 0) {
+    out.h = 0;  // grey: hue is meaningless, caller decides what to do with it
+    return out;
+  }
+
+  // Hue in sixths of the circle, each sixth being 65536/6 wide
+  float hue;
+  if (mx == r) {
+    hue = (float)(g - b) / delta;  // -1..1
+    if (hue < 0) hue += 6.0f;
+  } else if (mx == g) {
+    hue = 2.0f + (float)(b - r) / delta;
+  } else {
+    hue = 4.0f + (float)(r - g) / delta;
+  }
+  out.h = (uint16_t)(hue * (65536.0f / 6.0f));
+  return out;
 }
 
 float easeInCubic(float x) {
