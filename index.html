@@ -6,8 +6,9 @@
       body {
         font-family: sans-serif;
         text-align: center;
-        padding: 50px;
+        padding: 2rem;
         background: #f4f4f9;
+        margin: 0;
       }
       button {
         padding: 15px 25px;
@@ -66,7 +67,45 @@
         padding: 8px 16px;
         font-size: 15px;
       }
-      #tlBar {
+      .stripRow {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        gap: 8px;
+        margin: 6px 0;
+      }
+      .stripRow input[type="number"] {
+        width: 70px;
+      }
+      .stripRow button,
+      #addStripBtn {
+        padding: 4px 10px;
+        font-size: 13px;
+        margin: 0;
+      }
+      #addStripBtn {
+        margin-top: 8px;
+      }
+      #stripTabs button {
+        padding: 8px 16px;
+        font-size: 15px;
+        margin: 4px;
+        background: #e0e0e0;
+        color: #333;
+      }
+      #stripTabs button.selected {
+        background: #007bff;
+        color: white;
+      }
+      .track {
+        margin-top: 20px;
+        padding-top: 15px;
+        border-top: 1px solid #ddd;
+      }
+      .track h3 {
+        margin: 0 0 10px;
+      }
+      .tlBar {
         position: relative;
         height: 40px;
         margin: 15px 0 5px;
@@ -97,7 +136,7 @@
         font-size: 13px;
         color: #888;
       }
-      #tlHead {
+      .tlHead {
         position: absolute;
         top: 0;
         bottom: 0;
@@ -129,16 +168,21 @@
     </style>
   </head>
   <body>
-    <h1>ESP32 WebBLE Trigger</h1>
+    <h1>BLED</h1>
 
     <div id="connection" class="zone">
-      <h2>Connection</h2>
+      <h2>Setup</h2>
       <button id="connectBtn" class="connect">Connect to ESP32</button>
       <div id="status">Status: Disconnected</div>
+
+      <h3>Strips</h3>
+      <div id="stripList"></div>
+      <button id="addStripBtn">+ Add strip</button>
     </div>
 
     <div id="manual" class="zone">
       <h2>Manual</h2>
+      <div id="stripTabs"></div>
       <div>
         <button id="onBtn" class="on" disabled>ON</button>
         <button id="offBtn" class="off" disabled>OFF</button>
@@ -157,29 +201,30 @@
 
     <div id="timeline" class="zone">
       <h2>Timeline</h2>
-      <label>
-        Length (s):
-        <input type="number" id="tlLength" value="10" min="1" step="1" />
-      </label>
-      <button id="tlPlay" disabled>Play</button>
-      <button id="tlStop" disabled>Stop</button>
-      <label><input type="checkbox" id="tlLoop" /> Loop</label>
-
-      <div id="tlBar"><div id="tlHead"></div></div>
+      <button id="startAllBtn" disabled>Play all</button>
       <p class="hint">
-        Click the bar to add a keyframe. Each keyframe holds the color at that
+        Click a bar to add a keyframe. Each keyframe holds the color at that
         moment; the segment after it fades to the next color while running its
         animation.
       </p>
-      <div id="tlKeys"></div>
+      <div id="tracks"></div>
     </div>
 
     <script>
       // Use the same UUIDs as the ESP32 code
       const SERVICE_UUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
       const CHARACTERISTIC_UUID = "beb5483e-36e1-4688-b7f5-ea07361b26a8";
+      const FILL_CHARACTERISTIC_UUID = "154f969f-5195-4552-9aba-85922a7ba713";
+      const ANIMATION_CHARACTERISTIC_UUID = "4a9163c8-45ae-42a9-a7d7-e26485ca83e7";
+      const STRIPS_CHARACTERISTIC_UUID = "d3c6f0a2-5e1b-4f7a-9c38-2b7e4a1d9f60";
 
       const animations = ["solid", "chaser", "noise", "sin"];
+
+      // GPIOs that can drive a strip. Same list (and same reasons for the
+      // missing pins) as STRIP_PINS in the .ino, keep them in sync
+      const STRIP_PINS = [4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33];
+      const MAX_STRIPS = 6; // must match the .ino
+      const MAX_LEDS_PER_STRIP = 1000; // must match the .ino
 
       let device;
       let server;
@@ -187,11 +232,20 @@
       let characteristic;
       let fillCharacteristic;
       let animCharacteristic;
+      let stripsCharacteristic;
+      let connected = false;
 
       const connectBtn = document.getElementById("connectBtn");
       const onBtn = document.getElementById("onBtn");
       const offBtn = document.getElementById("offBtn");
       const statusMsg = document.getElementById("status");
+      const fillInput = document.getElementById("fill");
+      const fadeInput = document.getElementById("fade");
+      const stripList = document.getElementById("stripList");
+      const addStripBtn = document.getElementById("addStripBtn");
+      const stripTabs = document.getElementById("stripTabs");
+      const tracksEl = document.getElementById("tracks");
+      const startAllBtn = document.getElementById("startAllBtn");
 
       connectBtn.addEventListener("click", async () => {
         try {
@@ -209,14 +263,12 @@
 
           statusMsg.innerText = "Getting Characteristic...";
           characteristic = await service.getCharacteristic(CHARACTERISTIC_UUID);
-          fillCharacteristic = await service.getCharacteristic(
-            "154f969f-5195-4552-9aba-85922a7ba713",
-          );
-          animCharacteristic = await service.getCharacteristic(
-            "4a9163c8-45ae-42a9-a7d7-e26485ca83e7",
-          );
+          fillCharacteristic = await service.getCharacteristic(FILL_CHARACTERISTIC_UUID);
+          animCharacteristic = await service.getCharacteristic(ANIMATION_CHARACTERISTIC_UUID);
+          stripsCharacteristic = await service.getCharacteristic(STRIPS_CHARACTERISTIC_UUID);
 
           statusMsg.innerText = "Connected!";
+          sendStripConfig(); // the ESP32 uses whatever strips the page lists
           setControlsEnabled(true);
 
           device.addEventListener("gattserverdisconnected", () => {
@@ -234,20 +286,22 @@
           .querySelector("#anims")
           .insertAdjacentHTML(
             "beforeend",
-            `<button onclick="sendAnim(${i})" disabled>${animations[i]}</button>`,
+            `<button onclick="manualAnim(${i})" disabled>${animations[i]}</button>`,
           );
       }
 
       // Enable/disable every control that needs an active connection
       function setControlsEnabled(enabled) {
-        if (!enabled) stopTimeline();
+        connected = enabled;
+        if (!enabled) strips.forEach((s) => stopTrack(s.id));
         onBtn.disabled = !enabled;
         offBtn.disabled = !enabled;
-        document.getElementById("fill").disabled = !enabled;
+        fillInput.disabled = !enabled;
         document
           .querySelectorAll("#anims button")
           .forEach((btn) => (btn.disabled = !enabled));
-        tlPlayBtn.disabled = !enabled;
+        strips.forEach(updateTrackButtons);
+        startAllBtn.disabled = !enabled;
         connectBtn.disabled = enabled;
       }
 
@@ -261,11 +315,6 @@
           .catch((err) => console.log(err));
       }
 
-      function sendValue(val) {
-        queueWrite(characteristic, [val]);
-        console.log("Sent: " + val);
-      }
-
       // "#rrggbb" -> [r, g, b]
       function hexToRgb(color) {
         return [
@@ -275,53 +324,189 @@
         ];
       }
 
+      // --- COMMANDS ---
+      // Every command starts with the strip's GPIO pin. Each strip also
+      // remembers the last state sent to it (on, anim, color).
+      function sendPower(strip, on) {
+        strip.on = on;
+        queueWrite(characteristic, [strip.pin, on ? 1 : 0]);
+      }
+
       // Sends a target color and how long (ms) the ESP32 should take to fade
-      // to it. Payload: [r, g, b, durationHi, durationLo]
-      function sendFill(color, durationMs = 0) {
+      // to it. Payload: [pin, r, g, b, durationHi, durationLo]
+      function sendFill(strip, color, durationMs = 0) {
+        strip.color = color;
         const d = Math.min(65535, Math.max(0, Math.round(durationMs)));
-        queueWrite(fillCharacteristic, [...hexToRgb(color), d >> 8, d & 0xff]);
+        queueWrite(fillCharacteristic, [strip.pin, ...hexToRgb(color), d >> 8, d & 0xff]);
       }
 
+      function sendAnim(strip, animIndex) {
+        strip.anim = animIndex;
+        queueWrite(animCharacteristic, [strip.pin, animIndex]);
+      }
+
+      // The whole strip list: [pin, countHi, countLo] per strip
+      function sendStripConfig() {
+        queueWrite(
+          stripsCharacteristic,
+          strips.flatMap((s) => [s.pin, s.count >> 8, s.count & 0xff]),
+        );
+      }
+
+      // --- STRIPS ---
+      // The page identifies a strip by `id`, and the ESP32 identifies it by
+      // its pin. Each strip carries its own timeline.
+      let nextStripId = 0;
+      let nextKeyId = 0;
+      let strips = [];
+      let selectedStripId = null;
+
+      function createStrip(pin, count) {
+        const length = 10; // seconds
+        return {
+          id: nextStripId++,
+          pin,
+          count,
+          on: false,
+          anim: 0,
+          color: "#007800",
+          tl: {
+            length,
+            loop: false,
+            playing: false,
+            start: 0, // performance.now() when the current pass started
+            next: 0, // index of the next keyframe to fire (keyframes sorted)
+            // A keyframe holds the color AT a given time (in seconds). The segment
+            // between two keyframes runs the first one's animation while the ESP32
+            // fades from the first color to the second; we only tell it when to switch.
+            // The first and last keyframes are pinned to the start and end of the
+            // timeline: they can't be removed or moved, only recolored.
+            keyframes: [
+              // { id, time, anim, color: "#rrggbb", fixed?: "start" | "end" }
+              { id: nextKeyId++, time: 0, anim: 0, color: "#007800", fixed: "start" },
+              { id: nextKeyId++, time: length, anim: 0, color: "#007800", fixed: "end" },
+            ],
+          },
+        };
+      }
+
+      const stripById = (id) => strips.find((s) => s.id === id);
+      const selectedStrip = () => stripById(selectedStripId);
+
+      function renderAllStrips() {
+        renderStripList();
+        renderStripTabs();
+        renderTracks();
+      }
+
+      // Setup zone: one row per strip, with pin, LED count and remove.
+      // Pins used by other strips are greyed out in each dropdown.
+      function renderStripList() {
+        stripList.innerHTML = strips
+          .map((s) => {
+            const usedPins = strips.filter((o) => o !== s).map((o) => o.pin);
+            return `<div class="stripRow">
+              <label>
+                GPIO
+                <select onchange="setStripPin(${s.id}, this.value)">
+                  ${STRIP_PINS.map((p) => `<option value="${p}" ${p === s.pin ? "selected" : ""} ${usedPins.includes(p) ? "disabled" : ""}>${p}</option>`).join("")}
+                </select>
+              </label>
+              <label>
+                <input type="number" min="1" max="${MAX_LEDS_PER_STRIP}" step="1" value="${s.count}"
+                  onchange="setStripCount(${s.id}, this.value)" /> LEDs
+              </label>
+              <button onclick="removeStrip(${s.id})" ${strips.length <= 1 ? "disabled" : ""}>✕</button>
+            </div>`;
+          })
+          .join("");
+        addStripBtn.disabled = strips.length >= MAX_STRIPS;
+      }
+
+      // Manual zone: a row of radio-like buttons, in the same order as the list
+      function renderStripTabs() {
+        stripTabs.innerHTML = strips
+          .map(
+            (s) =>
+              `<button class="${s.id === selectedStripId ? "selected" : ""}"
+                onclick="selectStrip(${s.id})">GPIO ${s.pin}</button>`,
+          )
+          .join("");
+      }
+
+      function selectStrip(id) {
+        selectedStripId = id;
+        fillInput.value = selectedStrip().color;
+        renderStripTabs();
+      }
+
+      function addStrip() {
+        if (strips.length >= MAX_STRIPS) return;
+        const pin = STRIP_PINS.find((p) => !strips.some((s) => s.pin === p));
+        strips.push(createStrip(pin, 64));
+        renderAllStrips();
+        sendStripConfig();
+      }
+
+      function removeStrip(id) {
+        if (strips.length <= 1) return;
+        const strip = stripById(id);
+        stopTrack(id);
+        sendPower(strip, false); // so the pin starts clean if it's reused later
+        strips = strips.filter((s) => s.id !== id);
+        if (selectedStripId === id) selectStrip(strips[0].id);
+        renderAllStrips();
+        sendStripConfig();
+      }
+
+      function setStripPin(id, value) {
+        const strip = stripById(id);
+        const pin = parseInt(value);
+        if (strips.some((s) => s !== strip && s.pin === pin)) {
+          renderStripList(); // taken: put the dropdown back
+          return;
+        }
+        stopTrack(id);
+        const { on, anim, color } = strip;
+        queueWrite(characteristic, [strip.pin, 0]); // switch the old pin off...
+        strip.pin = pin;
+        renderAllStrips();
+        sendStripConfig();
+        // ...and carry the strip's state over to its new pin
+        sendPower(strip, on);
+        sendFill(strip, color, 0);
+        sendAnim(strip, anim);
+      }
+
+      function setStripCount(id, value) {
+        const strip = stripById(id);
+        strip.count = Math.min(MAX_LEDS_PER_STRIP, Math.max(1, parseInt(value) || 1));
+        renderStripList();
+        sendStripConfig();
+      }
+
+      addStripBtn.addEventListener("click", addStrip);
+
+      // --- MANUAL ---
+      // Every manual control acts on the strip selected in the tabs
       function changeFill(ev) {
-        const fade = parseInt(document.getElementById("fade").value) || 0;
-        sendFill(ev.target.value, fade);
+        sendFill(selectedStrip(), ev.target.value, parseInt(fadeInput.value) || 0);
       }
 
-      function sendAnim(animIndex) {
-        queueWrite(animCharacteristic, [animIndex]);
+      function manualAnim(animIndex) {
+        sendAnim(selectedStrip(), animIndex);
       }
+
+      onBtn.addEventListener("click", () => sendPower(selectedStrip(), true));
+      offBtn.addEventListener("click", () => sendPower(selectedStrip(), false));
 
       // --- TIMELINE ---
-      // A keyframe holds the color AT a given time (in seconds). The segment
-      // between two keyframes runs the first one's animation while the ESP32
-      // fades from the first color to the second; we only tell it when to switch.
-      // The first and last keyframes are pinned to the start and end of the
-      // timeline: they can't be removed or moved, only recolored.
-      let tlLength = 10; // seconds
-      let nextKeyId = 0;
-      let keyframes = [
-        // { id, time, anim, color: "#rrggbb", fixed?: "start" | "end" }
-        { id: nextKeyId++, time: 0, anim: 0, color: "#007800", fixed: "start" },
-        { id: nextKeyId++, time: tlLength, anim: 0, color: "#007800", fixed: "end" },
-      ];
-
-      let tlPlaying = false;
-      let tlStart = 0; // performance.now() when the current pass started
-      let tlNext = 0; // index of the next keyframe to fire (keyframes sorted)
-      let tlRaf = null;
-
-      const tlLengthInput = document.getElementById("tlLength");
-      const tlPlayBtn = document.getElementById("tlPlay");
-      const tlStopBtn = document.getElementById("tlStop");
-      const tlLoop = document.getElementById("tlLoop");
-      const tlBar = document.getElementById("tlBar");
-      const tlHead = document.getElementById("tlHead");
-      const tlKeys = document.getElementById("tlKeys");
+      // One track per strip, each with its own length, playback and keyframes
 
       // Sort by time, with the pinned start/end keyframes always at the ends
-      function sortKeyframes() {
+      function sortKeyframes(strip) {
         const rank = (k) => (k.fixed === "start" ? -1 : k.fixed === "end" ? 1 : 0);
-        keyframes.sort((a, b) => a.time - b.time || rank(a) - rank(b));
+        strip.tl.keyframes.sort((a, b) => a.time - b.time || rank(a) - rank(b));
       }
 
       // [r, g, b] 0..255 -> [h 0..360, s 0..1, v 0..1]
@@ -355,8 +540,9 @@
 
       // Color the strip would show at `time`. Mirrors the ESP32: HSV, shortest
       // hue arc, and grey/black endpoints borrow the other end's hue
-      function colorAt(time) {
-        sortKeyframes();
+      function colorAt(strip, time) {
+        sortKeyframes(strip);
+        const keyframes = strip.tl.keyframes;
         let i = 0;
         while (i < keyframes.length - 2 && keyframes[i + 1].time <= time) i++;
         const a = keyframes[i];
@@ -379,11 +565,45 @@
         ]);
       }
 
-      function renderTimeline() {
-        sortKeyframes();
+      // Rebuilds every track (when strips are added, removed or re-pinned)
+      function renderTracks() {
+        tracksEl.innerHTML = strips
+          .map(
+            (s) => `<div class="track">
+              <h3>GPIO ${s.pin}</h3>
+              <label>
+                Length (s):
+                <input type="number" id="length-${s.id}" value="${s.tl.length}" min="1" step="1"
+                  onchange="setTrackLength(${s.id}, this.value)" />
+              </label>
+              <button id="play-${s.id}" onclick="playTrack(${s.id})">Play</button>
+              <button id="stop-${s.id}" onclick="stopTrack(${s.id})">Stop</button>
+              <label>
+                <input type="checkbox" ${s.tl.loop ? "checked" : ""}
+                  onchange="stripById(${s.id}).tl.loop = this.checked" /> Loop
+              </label>
+              <div class="tlBar" id="bar-${s.id}" onclick="clickBar(event, ${s.id})">
+                <div class="tlHead" id="head-${s.id}"></div>
+              </div>
+              <div id="keys-${s.id}"></div>
+            </div>`,
+          )
+          .join("");
+        strips.forEach((s) => {
+          renderTrack(s);
+          updateTrackButtons(s);
+        });
+      }
 
-        tlBar.querySelectorAll(".tlSeg, .tlMark").forEach((m) => m.remove());
-        const pct = (t) => (t / tlLength) * 100;
+      // Redraws one track's bar and keyframe rows
+      function renderTrack(strip) {
+        sortKeyframes(strip);
+        const { keyframes, length } = strip.tl;
+        const bar = document.getElementById(`bar-${strip.id}`);
+        const keysEl = document.getElementById(`keys-${strip.id}`);
+
+        bar.querySelectorAll(".tlSeg, .tlMark").forEach((m) => m.remove());
+        const pct = (t) => (t / length) * 100;
 
         // One gradient rectangle per segment, drawn behind the playhead.
         // "in hsl shorter hue" makes the preview sweep hue the way the ESP32
@@ -391,7 +611,7 @@
         for (let i = 0; i < keyframes.length - 1; i++) {
           const a = keyframes[i];
           const b = keyframes[i + 1];
-          tlBar.insertAdjacentHTML(
+          bar.insertAdjacentHTML(
             "afterbegin",
             `<div class="tlSeg" style="left:${pct(a.time)}%; width:${pct(b.time - a.time)}%;
               background: linear-gradient(to right in hsl shorter hue, ${a.color}, ${b.color})"
@@ -401,7 +621,7 @@
 
         // Keyframe markers on top
         for (const k of keyframes) {
-          tlBar.insertAdjacentHTML(
+          bar.insertAdjacentHTML(
             "beforeend",
             `<div class="tlMark" style="left:${pct(k.time)}%" title="${k.time}s ${k.color}"></div>`,
           );
@@ -409,142 +629,172 @@
 
         // One editable row per keyframe. Pinned ones can't be moved or removed,
         // and the end keyframe has no animation since nothing runs after it.
-        tlKeys.innerHTML = keyframes
+        keysEl.innerHTML = keyframes
           .map(
             (k) => `<div class="tlKey">
               ${
                 k.fixed
                   ? `<span class="fixed">${k.fixed} (${k.time}s)</span>`
-                  : `<input type="number" min="0" max="${tlLength}" step="0.1" value="${k.time}"
-                      onchange="updateKeyframe(${k.id}, 'time', this.value)" /> s`
+                  : `<input type="number" min="0" max="${length}" step="0.1" value="${k.time}"
+                      onchange="updateKeyframe(${strip.id}, ${k.id}, 'time', this.value)" /> s`
               }
               <input type="color" value="${k.color}"
-                onchange="updateKeyframe(${k.id}, 'color', this.value)" />
+                onchange="updateKeyframe(${strip.id}, ${k.id}, 'color', this.value)" />
               ${
                 k.fixed === "end"
                   ? ""
-                  : `<select onchange="updateKeyframe(${k.id}, 'anim', this.value)">
+                  : `<select onchange="updateKeyframe(${strip.id}, ${k.id}, 'anim', this.value)">
                       ${animations.map((name, i) => `<option value="${i}" ${i === k.anim ? "selected" : ""}>${name}</option>`).join("")}
                     </select>`
               }
-              ${k.fixed ? "" : `<button onclick="removeKeyframe(${k.id})">✕</button>`}
+              ${k.fixed ? "" : `<button onclick="removeKeyframe(${strip.id}, ${k.id})">✕</button>`}
             </div>`,
           )
           .join("");
       }
 
-      // New keyframes take the color the gradient already has at that time,
-      // so adding one doesn't change what the strip does until you edit it
-      function addKeyframe(time, anim = 0) {
-        const color = colorAt(time);
-        keyframes.push({ id: nextKeyId++, time, anim, color });
-        renderTimeline();
+      function updateTrackButtons(strip) {
+        // Play stays clickable while playing: it restarts the track
+        document.getElementById(`play-${strip.id}`).disabled = !connected;
+        document.getElementById(`stop-${strip.id}`).disabled = !strip.tl.playing;
       }
 
-      function updateKeyframe(id, field, value) {
-        const k = keyframes.find((k) => k.id === id);
+      function setHead(strip, fraction) {
+        document.getElementById(`head-${strip.id}`).style.left = `${fraction * 100}%`;
+      }
+
+      // New keyframes take the color the gradient already has at that time,
+      // so adding one doesn't change what the strip does until you edit it
+      function addKeyframe(strip, time, anim = 0) {
+        const color = colorAt(strip, time);
+        strip.tl.keyframes.push({ id: nextKeyId++, time, anim, color });
+        renderTrack(strip);
+      }
+
+      function updateKeyframe(stripId, keyId, field, value) {
+        const strip = stripById(stripId);
+        const k = strip.tl.keyframes.find((k) => k.id === keyId);
         if (!k) return;
         if (field === "time") {
           if (k.fixed) return;
-          k.time = Math.min(tlLength, Math.max(0, parseFloat(value) || 0));
+          k.time = Math.min(strip.tl.length, Math.max(0, parseFloat(value) || 0));
         } else if (field === "anim") {
           k.anim = parseInt(value);
         } else if (field === "color") {
           k.color = value;
         }
-        renderTimeline();
+        renderTrack(strip);
       }
 
-      function removeKeyframe(id) {
-        keyframes = keyframes.filter((k) => k.id !== id || k.fixed);
-        renderTimeline();
+      function removeKeyframe(stripId, keyId) {
+        const strip = stripById(stripId);
+        strip.tl.keyframes = strip.tl.keyframes.filter((k) => k.id !== keyId || k.fixed);
+        renderTrack(strip);
       }
 
-      function setTimelineLength(seconds) {
-        tlLength = Math.max(1, parseFloat(seconds) || 1);
-        tlLengthInput.value = tlLength;
+      function setTrackLength(stripId, seconds) {
+        const strip = stripById(stripId);
+        const length = Math.max(1, parseFloat(seconds) || 1);
+        strip.tl.length = length;
+        document.getElementById(`length-${stripId}`).value = length;
         // The end keyframe follows the new length; anything past it is pulled back
-        for (const k of keyframes) {
-          k.time = k.fixed === "end" ? tlLength : Math.min(k.time, tlLength);
+        for (const k of strip.tl.keyframes) {
+          k.time = k.fixed === "end" ? length : Math.min(k.time, length);
         }
-        renderTimeline();
+        renderTrack(strip);
       }
 
-      // Click on the bar -> new keyframe at that time
-      tlBar.addEventListener("click", (ev) => {
-        const rect = tlBar.getBoundingClientRect();
-        const t = ((ev.clientX - rect.left) / rect.width) * tlLength;
-        addKeyframe(Math.round(t * 10) / 10);
-      });
-
-      tlLengthInput.addEventListener("change", (ev) =>
-        setTimelineLength(ev.target.value),
-      );
-
-      renderTimeline(); // show the pinned start/end keyframes right away
+      // Click on a bar -> new keyframe at that time
+      function clickBar(ev, stripId) {
+        const strip = stripById(stripId);
+        const rect = ev.currentTarget.getBoundingClientRect();
+        const t = ((ev.clientX - rect.left) / rect.width) * strip.tl.length;
+        addKeyframe(strip, Math.round(t * 10) / 10);
+      }
 
       // A pass begins by turning on the light, snapping to the start keyframe's
       // color, so the first segment fades from exactly where the gradient says it should
-      function startPass() {
-        sendValue(1);
-        tlNext = 0;
-        sendFill(keyframes[0].color, 0);
+      function startPass(strip) {
+        sendPower(strip, true);
+        strip.tl.next = 0;
+        sendFill(strip, strip.tl.keyframes[0].color, 0);
       }
 
-      function playTimeline() {
-        sortKeyframes();
-        tlPlaying = true;
-        tlStart = performance.now();
-        startPass();
-        tlPlayBtn.disabled = true;
-        tlStopBtn.disabled = false;
-        tlRaf = requestAnimationFrame(tickTimeline);
+      // One animation frame loop drives every playing track
+      let tlRaf = null;
+
+      // Plays a track from the start. If it's already playing, it jumps back
+      // to the start. `now` lets Play all restart every track on the same instant.
+      function playTrack(stripId, now = performance.now()) {
+        const strip = stripById(stripId);
+        if (!connected) return;
+        sortKeyframes(strip);
+        strip.tl.playing = true;
+        strip.tl.start = now;
+        setHead(strip, 0);
+        startPass(strip);
+        updateTrackButtons(strip);
+        if (tlRaf === null) tlRaf = requestAnimationFrame(tick);
       }
 
-      function stopTimeline() {
-        if (!tlPlaying) return;
-        tlPlaying = false;
-        cancelAnimationFrame(tlRaf);
-        tlHead.style.left = "0%";
-        tlPlayBtn.disabled = !animCharacteristic;
-        tlStopBtn.disabled = true;
+      function stopTrack(stripId) {
+        const strip = stripById(stripId);
+        if (!strip || !strip.tl.playing) return;
+        strip.tl.playing = false;
+        setHead(strip, 0);
+        updateTrackButtons(strip);
       }
 
-      function tickTimeline(now) {
-        if (!tlPlaying) return;
-        let elapsed = (now - tlStart) / 1000;
+      // (Re)starts every strip's track from the start, all with the same start
+      // time. Tracks with different lengths or loop settings still drift apart
+      // afterwards, since each one runs its own passes.
+      function playAllTracks() {
+        const now = performance.now();
+        strips.forEach((s) => playTrack(s.id, now));
+      }
+      startAllBtn.addEventListener("click", playAllTracks);
+
+      function tick(now) {
+        for (const strip of strips) {
+          if (strip.tl.playing) tickTrack(strip, now);
+        }
+        tlRaf = strips.some((s) => s.tl.playing) ? requestAnimationFrame(tick) : null;
+      }
+
+      function tickTrack(strip, now) {
+        const tl = strip.tl;
+        const keyframes = tl.keyframes;
+        let elapsed = (now - tl.start) / 1000;
 
         // Fire every segment whose start has passed: tell the ESP32 to fade to
         // the NEXT keyframe's color over the segment, running this one's animation.
         // The end keyframe starts no segment, so it never fires.
-        while (tlNext < keyframes.length - 1 && keyframes[tlNext].time <= elapsed) {
-          const k = keyframes[tlNext];
-          const next = keyframes[tlNext + 1];
-          sendFill(next.color, (next.time - k.time) * 1000);
-          sendAnim(k.anim);
-          tlNext++;
+        while (tl.next < keyframes.length - 1 && keyframes[tl.next].time <= elapsed) {
+          const k = keyframes[tl.next];
+          const next = keyframes[tl.next + 1];
+          sendFill(strip, next.color, (next.time - k.time) * 1000);
+          sendAnim(strip, k.anim);
+          tl.next++;
         }
 
-        if (elapsed >= tlLength) {
-          if (tlLoop.checked) {
-            tlStart += tlLength * 1000;
-            startPass();
-            elapsed -= tlLength;
+        if (elapsed >= tl.length) {
+          if (tl.loop) {
+            tl.start += tl.length * 1000;
+            startPass(strip);
+            elapsed -= tl.length;
           } else {
-            stopTimeline();
+            stopTrack(strip.id);
             return;
           }
         }
 
-        tlHead.style.left = `${(elapsed / tlLength) * 100}%`;
-        tlRaf = requestAnimationFrame(tickTimeline);
+        setHead(strip, elapsed / tl.length);
       }
 
-      tlPlayBtn.addEventListener("click", playTimeline);
-      tlStopBtn.addEventListener("click", stopTimeline);
-
-      onBtn.addEventListener("click", () => sendValue(1));
-      offBtn.addEventListener("click", () => sendValue(0));
+      // Start with one 64-LED strip on GPIO 27, same as the ESP32's default
+      strips.push(createStrip(27, 64));
+      selectedStripId = strips[0].id;
+      renderAllStrips();
     </script>
   </body>
 </html>

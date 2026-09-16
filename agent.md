@@ -4,7 +4,7 @@ Guidance for AI coding agents working in this repository.
 
 ## Project overview
 
-**ESP32 WebBLE** is a small template that lets a webpage control an ESP32 over Bluetooth Low Energy using the [Web Bluetooth API](https://caniuse.com/web-bluetooth). In this version, the page drives a 64-pixel NeoPixel strip: it turns the strip on or off, sets the fill color, and picks an animation.
+**ESP32 WebBLE** (the page is titled "BLED") is a small ateliernum template that lets a webpage control an ESP32 over Bluetooth Low Energy using the [Web Bluetooth API](https://caniuse.com/web-bluetooth). The page drives **up to 6 NeoPixel strips**. For each strip it can turn it on or off, set a fill color with a fade, pick an animation, and play a keyframe timeline. The page decides which strips exist: the pin and LED count for each strip are set in the page, not in the firmware.
 
 There's no build system, no package manager and no tests. The repo has two independent parts that talk to each other only over BLE:
 
@@ -12,7 +12,7 @@ There's no build system, no package manager and no tests. The repo has two indep
 | --- | --- |
 | [index.html](index.html) | Client: one static page with inline CSS and JS, and no dependencies |
 | [ESP32_webBLE/ESP32_webBLE.ino](ESP32_webBLE/ESP32_webBLE.ino) | Firmware: an Arduino sketch that runs a BLE GATT server and drives the NeoPixels |
-| [README.md](README.md) | User docs. The YAML front matter (`template`, `title`, `thumbnail`, `tags`…) is template-catalog metadata, so keep it valid |
+| [README.md](README.md) | User docs, written for design students with no technical background. Keep that tone. The YAML front matter (`template`, `title`, `thumbnail`, `tags`…) is template-catalog metadata, so keep it valid |
 | [thumbnail.jpg](thumbnail.jpg) | Thumbnail that the README front matter points to |
 
 ## BLE protocol (the contract between both sides)
@@ -21,52 +21,97 @@ The page and the firmware each hard-code the same identifiers. **If you change a
 
 - **Device name:** `ESP32_BLE_Trigger`. The page's `requestDevice` filter uses it, and so does `BLEDevice::init` in the firmware.
 - **Service UUID:** `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
+- **Strips are addressed by GPIO pin.** Every command starts with the pin of the strip it targets, so adding or removing strips never shifts addresses.
 
 | Characteristic | UUID | Payload | Firmware handler |
 | --- | --- | --- | --- |
-| Trigger (on/off) | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | 1 byte: `1` = on, `0` = off | `MyCallbacks` → `ledOn` |
-| Fill color | `154f969f-5195-4552-9aba-85922a7ba713` | 3 or 5 bytes: `[r, g, b]` or `[r, g, b, durHi, durLo]` (fade duration in ms, big-endian uint16; omitted = instant) | `fillCallbacks` → `targetColor`, `transitionDuration` |
-| Animation | `4a9163c8-45ae-42a9-a7d7-e26485ca83e7` | 1 byte: animation index | `animationCallbacks` → `animation` |
+| Power (on/off) | `beb5483e-36e1-4688-b7f5-ea07361b26a8` | `[pin, 1 = on \| 0 = off]` | `powerCallbacks` → `pinStates[pin].on` |
+| Fill color | `154f969f-5195-4552-9aba-85922a7ba713` | `[pin, r, g, b]` or `[pin, r, g, b, durHi, durLo]` (fade duration in ms, big-endian uint16; omitted = instant) | `fillCallbacks` → `pinStates[pin]` transition fields |
+| Animation | `4a9163c8-45ae-42a9-a7d7-e26485ca83e7` | `[pin, animation index]` | `animationCallbacks` → `pinStates[pin].animation` |
+| Strips | `d3c6f0a2-5e1b-4f7a-9c38-2b7e4a1d9f60` | `[pin, countHi, countLo]` once per strip, in list order | `stripsCallbacks` → `pendingConfig`, applied in `loop()` |
 
 All characteristics are `READ | WRITE`. The page only writes to them and never reads or subscribes.
 
-**The animation indices must match on both sides.** The JS array `animations = ["solid", "chaser", "noise", "sin"]` in `index.html` has to stay in the same order as the C enum `ANIMATION { SOLID, CHASER, NOISE, SIN }` in the sketch. To add an animation:
-1. Append it to the enum.
-2. Add a `case` in the `switch` in `loop()`.
-3. Append its name to the JS `animations` array. The buttons are generated from that array automatically.
+**Lists that must match on both sides:**
+- **Animations:** the JS array `animations = ["solid", "chaser", "noise", "sin"]` has to stay in the same order as the C enum `ANIMATION { SOLID, CHASER, NOISE, SIN }`. To add an animation:
+  1. Append it to the enum.
+  2. Add a `case` in the `switch` in `renderStrip()`.
+  3. Append its name to the JS `animations` array. The buttons and dropdowns are generated from that array.
+- **Allowed pins:** `STRIP_PINS` in both files. The firmware's comment explains why each missing pin is left out (boot/strapping, USB serial, flash, input-only, and GPIO 2 because it's the connection LED).
+- **Limits:** `MAX_STRIPS = 6` and `MAX_LEDS_PER_STRIP = 1000`. The strip count is capped at 6 so the whole strips payload (6 × 3 bytes) fits in one default-size BLE write (20 bytes). If you raise it, check the write size.
 
 ## Firmware notes
 
 - Target: an ESP32 on **Arduino-ESP32 core 3.x**. In core 3.x, `getValue()` returns an Arduino `String`. Older cores return `std::string`.
 - Libraries: the built-in ESP32 BLE (`BLEDevice.h`, `BLEServer.h`, `BLEUtils.h`) and **Adafruit NeoPixel**.
-- Pins: the onboard LED is on GPIO 2 and lights up while a client is connected. The NeoPixel data line is on GPIO 27 (`NEO_GRB + NEO_KHZ800`).
+- The onboard LED on GPIO 2 lights up while a client is connected. Strips use `NEO_GRB + NEO_KHZ800`. At boot, before any page connects, there's one 64-LED strip on GPIO 27.
+- **State lives per pin, not per strip:** `PinState pinStates[40]` holds `on`, `animation` and the color-transition fields. The strip objects (`Adafruit_NeoPixel *strips[MAX_STRIPS]`) only know their pin and length, so rebuilding the strip list never loses state.
+- **Threading:** BLE callbacks run on a different FreeRTOS task than `loop()`.
+  - Every read or write of `pinStates` and of the pending config happens inside `portENTER_CRITICAL(&stateMux)`. Keep those sections short, with no `Serial` or `delay` inside.
+  - The strips callback never touches the strip objects. It copies the payload into `pendingConfig`, and `applyPendingConfig()` rebuilds the strips in `loop()`.
+  - That rebuild reuses strips whose pin and count haven't changed, so they don't flicker. It clears and frees the strips that were removed **before** creating new ones, because the `Adafruit_NeoPixel` destructor releases its pin.
 - `loop()` runs at about 60 fps (`delay(16)`). Each frame it:
-  - calls `updateColorTransition()`, which moves `currentColor` along the `startColor → targetColor` fade based on `transitionStart` / `transitionDuration`,
-  - restarts advertising after a client disconnects, and
-  - renders the current animation from the global state (`ledOn`, `animation`) using local `r/g/b` copied from `currentColor`.
-- **Colors are transitions, interpolated in HSV.** A fill write converts the RGB target with `rgbToHsv` into `targetHSV` and captures `startHSV` from `currentHSV`, so a new target mid-fade starts from where the pixels are. Hue takes the shortest arc (`hueDelta`, signed), and if either endpoint is black/grey (`s == 0 || v == 0`) it borrows the other endpoint's hue so the fade doesn't sweep through the rainbow. `updateColorTransition` lerps H/S/V and rebuilds `currentColor` via `pixels.ColorHSV`. Animations should only ever read `r/g/b` (i.e. `currentColor`), never the HSV state. `rgbToHsv` returns a `struct`, so it needs the explicit prototype after the struct; don't remove it or Arduino's auto-generated one lands above the struct and the sketch won't compile.
-- **Keep BLE callbacks tiny.** They should only set global variables, and all the real work belongs in `loop()`. The README recommends the same flag pattern.
-- The noise animation uses the hand-written 1D Perlin helpers at the bottom of the sketch (`hash1D`, `fade`, `llerp`, `perlin1D`, `perlin1D_normalized`). Arduino IDE generates function prototypes automatically, which is why these can be defined after `loop()`.
-- `loop()` prints debug output to Serial at 115200 baud on every frame.
+  - restarts advertising after a client disconnects,
+  - applies a pending strip list,
+  - for each strip, locks, calls `updateColorTransition(pinStates[pin])`, copies the state, unlocks, then `renderStrip(pixels, state)`,
+  - calls `printStatus()`, which logs every strip's `GPIO on animation r g b` to Serial (115200 baud) every 250 ms.
+- **Colors are transitions, interpolated in HSV.**
+  - A fill write converts the RGB target with `rgbToHsv` into `targetHSV` and captures `startHSV` from `currentHSV`. A new target mid-fade therefore starts from where the pixels are.
+  - Hue takes the shortest arc (`hueDelta`, signed).
+  - If either endpoint is black or grey (`s == 0 || v == 0`), it borrows the other endpoint's hue, so the fade doesn't sweep through the rainbow.
+  - `updateColorTransition` lerps H, S and V and rebuilds `currentColor` via `Adafruit_NeoPixel::ColorHSV`.
+  - Animations should only ever read `r/g/b` (copied from `currentColor`), never the HSV state.
+- **Explicit prototypes:** `rgbToHsv`, `updateColorTransition` and `renderStrip` use the `HSV` / `PinState` structs, so they have explicit prototypes after the struct definitions. Don't remove them: Arduino's auto-generated prototypes could land above the structs, and the sketch would stop compiling.
+- The noise animation uses the hand-written 1D Perlin helpers at the bottom of the sketch (`hash1D`, `fade`, `llerp`, `perlin1D`, `perlin1D_normalized`).
 
 ## Web client notes
 
 - It only works in **Chromium and Google Chrome**, on a secure context (`https://` or `localhost`). Web Bluetooth needs a user gesture, so the connection has to start from the "Connect" button click.
 - The page is plain vanilla JS with no framework and no bundler. Keep it that way unless asked otherwise.
 - Only one client can connect to the ESP32 at a time.
-- The UI state follows the connection: `setControlsEnabled(enabled)` turns on the on/off buttons, the color picker, the animation buttons and the timeline Play button after connecting, and turns them off again on `gattserverdisconnected`. Any new control that writes to a characteristic should be added there.
-- **All BLE writes go through `queueWrite(char, bytes)`.** Web Bluetooth rejects a write while another is in flight, so writes are chained one after the other. `queueWrite` also no-ops when the characteristic is `undefined`, so callers don't need their own guard.
-- **Timeline:** `keyframes` is an array of `{ id, time, anim, color, fixed? }` (`color` is `"#rrggbb"`). A keyframe's color is the color **at** that time. The segment between keyframes *i* and *i+1* runs `keyframes[i].anim` while fading from `keyframes[i].color` to `keyframes[i+1].color`; the bar draws each segment as a `linear-gradient(to right in hsl shorter hue, …)` rectangle (`.tlSeg`) with a marker (`.tlMark`) at every keyframe, and `colorAt` interpolates in HSV with the same shortest-arc / hue-borrowing rules as the firmware so the preview matches the strip. Two pinned keyframes always exist: `fixed: "start"` at 0 s and `fixed: "end"` at `tlLength`. They can be recolored but not moved or removed, and `setTimelineLength` keeps the end one on the new length. The end keyframe has no animation control since no segment follows it. `sortKeyframes` keeps them at the ends even on ties. New keyframes get `colorAt(time)`, the gradient's interpolated color, so inserting one doesn't change the output. Playback (`playTimeline` / `tickTimeline`, `requestAnimationFrame`-driven) starts each pass with `startPass()`, which snaps to the start color (`sendFill(color, 0)`), then when segment *i* begins sends `sendFill(keyframes[i+1].color, segmentDuration)` and `sendAnim(keyframes[i].anim)`. So the ESP32 gets two small writes per segment and renders the animation and fade itself; nothing is streamed. The manual color picker uses the "Fade (ms)" input instead. `tlLength` (seconds) is set by the "Length" input via `setTimelineLength`, which clamps existing keyframes to the new end. Keyframes are added by clicking the bar (they take the main color picker's current value) and edited in the rows rendered by `renderTimeline`.
+- The UI has three zones:
+  - **Setup:** the connect button, the status line, and the strip list (`renderStripList`).
+  - **Manual:** the strip selector buttons (`renderStripTabs`), on/off, the animation buttons, and color + fade.
+  - **Timeline:** one track per strip (`renderTracks` / `renderTrack`).
+- **Strips model:** `strips` is an array of objects created by `createStrip(pin, count)`. Each one holds:
+  - `id`, the page-side identity (the ESP32 only sees `pin`),
+  - `pin` and `count`,
+  - the last state sent to it: `on`, `anim`, `color`,
+  - `tl`, its own timeline: `length`, `loop`, `playing`, `start`, `next`, `keyframes`.
+  
+  `renderAllStrips()` redraws all three zones. Call it whenever a strip is added, removed or moved to another pin, and follow up with `sendStripConfig()`.
+  - Each pin dropdown greys out the pins used by other strips.
+  - The last strip can't be removed, and "+ Add strip" is disabled at `MAX_STRIPS`.
+  - `setStripPin` switches the old pin off, sends the new list, then re-sends the strip's `on/color/anim` to the new pin so its state follows it.
+  - `removeStrip` switches the strip's pin off first.
+  - The page sends the strip list on connect.
+- **Manual zone:** the selector buttons are radio-like and stay in list order. `selectedStripId` is the strip the manual controls act on. Selecting a strip sets the color picker to that strip's last color.
+- **All BLE writes go through `queueWrite(char, bytes)`.** Web Bluetooth rejects a write while another is in flight, so writes are chained one after the other. `queueWrite` also no-ops when the characteristic is `undefined`. Commands are sent with `sendPower(strip, on)`, `sendFill(strip, color, ms)`, `sendAnim(strip, i)` and `sendStripConfig()`. The first three also record the state on the strip object. Because the queue is serial and each write waits for a response, many strips firing keyframes at the same instant arrive slightly staggered.
+- `setControlsEnabled(enabled)` sets `connected`, stops every track on disconnect, and toggles the manual controls and each track's Play/Stop (`updateTrackButtons`).
+- **Timeline (per strip):**
+  - **Keyframes:** `strip.tl.keyframes` is an array of `{ id, time, anim, color, fixed? }`, where `color` is `"#rrggbb"`. A keyframe's color is the color **at** that time.
+  - **Segments:** the segment between keyframes *i* and *i+1* runs `keyframes[i].anim` while fading from `keyframes[i].color` to `keyframes[i+1].color`.
+  - **Drawing:** each track's bar (`#bar-<id>`) draws every segment as a `linear-gradient(to right in hsl shorter hue, …)` rectangle (`.tlSeg`), with a marker (`.tlMark`) at every keyframe.
+  - **Preview color:** `colorAt(strip, time)` interpolates in HSV with the same shortest-arc and hue-borrowing rules as the firmware, so the preview matches the strip.
+  - **Pinned keyframes:** two always exist, `fixed: "start"` at 0 s and `fixed: "end"` at `tl.length`. They can be recolored but not moved or removed. `setTrackLength` keeps the end one on the new length. The end keyframe has no animation control, since no segment follows it.
+  - **New keyframes** take `colorAt(time)`, so inserting one doesn't change the output.
+  - **Playback:** tracks play independently, and a single `requestAnimationFrame` loop (`tick`) advances every playing track (`tickTrack`).
+    - `playTrack(id, now)` always plays from the start, so pressing Play on a track that's already playing restarts it. Play stays enabled while playing.
+    - "Play all" (`playAllTracks`) calls `playTrack` for every strip with one shared `now`, so all tracks (re)start on the same instant.
+    - Each pass starts with `startPass(strip)`: power on, then snap to the start color.
+    - When segment *i* begins, the page sends `sendFill(strip, keyframes[i+1].color, segmentDuration)` and `sendAnim(strip, keyframes[i].anim)`. The ESP32 renders the animation and the fade itself; nothing is streamed.
+    - At the end, the track loops if `tl.loop` is set, otherwise it stops.
 
 ## Running
 
 - **Web:** serve `index.html` with any static server, for example `npx serve` or `python -m http.server`, or host it on GitHub Pages. Then open it in Chrome.
 - **Firmware:** open `ESP32_webBLE/ESP32_webBLE.ino` in Arduino IDE with the ESP32 board package and the Adafruit NeoPixel library installed, then upload it to the board.
-- There are no automated tests. To check a change, flash the board, connect from the page and watch the Serial Monitor.
+- There are no automated tests. To check a change, flash the board, connect from the page and watch the Serial Monitor. Page logic can also be exercised headlessly with jsdom and a fake `navigator.bluetooth` that records the bytes written to each characteristic.
 
 ## Known quirks
 
 - `animationCallbacks` doesn't validate the index. Out-of-range values fall through to the `default` case, which lights pixel 0 dim red.
+- Tracks aren't locked together. "Play all" starts them on the same instant, but tracks with different lengths or loop settings drift apart after their first pass.
 
 ## Conventions
 

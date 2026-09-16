@@ -8,12 +8,38 @@
 #define DEVICE_NAME "ESP32_BLE_Trigger"
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define FILL_CHARACTERISTIC_UUID "154f969f-5195-4552-9aba-85922a7ba713"
+#define ANIMATION_CHARACTERISTIC_UUID "4a9163c8-45ae-42a9-a7d7-e26485ca83e7"
+#define STRIPS_CHARACTERISTIC_UUID "d3c6f0a2-5e1b-4f7a-9c38-2b7e4a1d9f60"
 
-bool ledOn = false;
-const int ledPin = 2;  // Onboard LED
+const int ledPin = 2;  // Onboard LED, lights up while a client is connected
 
-const unsigned int numpixels = 64;
-Adafruit_NeoPixel pixels(numpixels, 27, NEO_GRB + NEO_KHZ800);
+// --- STRIPS ---
+// The page decides how many strips there are, which pin each one is on and
+// how many LEDs it has, and sends that list over BLE. Every other command
+// names its strip by GPIO pin, so a strip keeps its state when others are
+// added or removed.
+#define MAX_STRIPS 6  // 6 strips x 3 bytes fits in one default-size BLE write
+#define MAX_LEDS_PER_STRIP 1000
+#define NUM_GPIO 40
+
+// GPIOs that can drive a strip on a classic ESP32 DevKit
+// (keep in sync with STRIP_PINS in index.html). Left out on purpose:
+//   0        BOOT button
+//   1, 3     USB serial (uploads and the Serial Monitor)
+//   2        onboard LED, used to show the connection
+//   6..11    wired to the flash memory
+//   12       must stay low at boot or the board may not start
+//   34..39   input only
+// Note: 16 and 17 are taken by PSRAM on WROVER modules (fine on WROOM DevKits).
+const uint8_t STRIP_PINS[] = { 4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33 };
+
+typedef enum {
+  SOLID,
+  CHASER,
+  NOISE,
+  SIN,
+} ANIMATION;
 
 // --- COLOR TRANSITION ---
 // The page sends a target color and a duration. currentColor (what the
@@ -26,31 +52,52 @@ struct HSV {
   uint8_t s;   // 0..255
   uint8_t v;   // 0..255
 };
-// Explicit prototype: Arduino would otherwise auto-generate one above the
-// struct definition and fail to compile
+
+// Everything the page controls about one strip. It's stored per GPIO pin
+// rather than per strip, so it survives the strip list being rebuilt.
+struct PinState {
+  bool on = false;
+  uint8_t animation = SOLID;
+  uint8_t currentColor[3] = { 0, 120, 0 };
+  HSV currentHSV = { 21845, 255, 120 };  // green, matches currentColor
+  HSV startHSV = { 21845, 255, 120 };
+  HSV targetHSV = { 21845, 255, 120 };
+  int32_t hueDelta = 0;                  // signed shortest-arc distance start -> target
+  unsigned long transitionStart = 0;     // millis() when the fade began
+  unsigned long transitionDuration = 0;  // ms, 0 = snap to target
+};
+
+// Explicit prototypes: Arduino would otherwise auto-generate them above the
+// struct definitions and fail to compile
 HSV rgbToHsv(uint8_t r, uint8_t g, uint8_t b);
+void updateColorTransition(PinState &st);
+void renderStrip(Adafruit_NeoPixel &pixels, const PinState &st);
 
-uint8_t currentColor[3] = { 0, 120, 0 };
-HSV currentHSV = { 21845, 255, 120 };  // green, matches currentColor
-HSV startHSV = currentHSV;
-HSV targetHSV = currentHSV;
-int32_t hueDelta = 0;                  // signed shortest-arc distance start -> target
-unsigned long transitionStart = 0;     // millis() when the fade began
-unsigned long transitionDuration = 0;  // ms, 0 = snap to target
+PinState pinStates[NUM_GPIO];
 
-typedef enum {
-  SOLID,
-  CHASER,
-  NOISE,
-  SIN,
-} ANIMATION;
+Adafruit_NeoPixel *strips[MAX_STRIPS];
+uint8_t stripCount = 0;
 
-uint8_t animation = SOLID;
+// The BLE callbacks run on a different task than loop(). This lock stops
+// them from changing a strip's state while loop() is reading it.
+portMUX_TYPE stateMux = portMUX_INITIALIZER_UNLOCKED;
+
+// A new strip list waiting for loop() to apply it
+uint8_t pendingConfig[MAX_STRIPS * 3];
+size_t pendingConfigLen = 0;
+bool configPending = false;
 
 // --- NEW VARIABLES FOR CONNECTION STATE ---
 BLEServer *pServer = NULL;
 bool deviceConnected = false;
 bool oldDeviceConnected = false;
+
+bool isStripPin(int pin) {
+  for (uint8_t p : STRIP_PINS) {
+    if (p == pin) return true;
+  }
+  return false;
+}
 
 // --- NEW SERVER CALLBACKS ---
 // This handles Connect and Disconnect events
@@ -68,24 +115,25 @@ class MyServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-// Callback class to handle incoming data
-class MyCallbacks : public BLECharacteristicCallbacks {
-  // Note: In ESP32 Core 3.x, getValue() returns a String object
+// Callback classes to handle incoming data. Every command starts with the
+// GPIO pin of the strip it's meant for.
+// Note: In ESP32 Core 3.x, getValue() returns a String object
+class powerCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
 
-    if (value.length() > 0) {
-      uint8_t receivedVal = (uint8_t)value[0];
+    // Payload: [pin, 1 = on | 0 = off]
+    if (value.length() < 2 || !isStripPin((uint8_t)value[0])) return;
+    uint8_t pin = (uint8_t)value[0];
+    uint8_t receivedVal = (uint8_t)value[1];
 
-      Serial.print("Received Value: ");
-      Serial.println(receivedVal);
-
-      if (receivedVal == 1) {
-        ledOn = true;
-      } else if (receivedVal == 0) {
-        ledOn = false;
-      }
+    portENTER_CRITICAL(&stateMux);
+    if (receivedVal == 1) {
+      pinStates[pin].on = true;
+    } else if (receivedVal == 0) {
+      pinStates[pin].on = false;
     }
+    portEXIT_CRITICAL(&stateMux);
   }
 };
 
@@ -93,27 +141,33 @@ class fillCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
 
-    // Payload: [r, g, b] or [r, g, b, durationHi, durationLo] (ms)
-    if (value.length() >= 3) {
-      startHSV = currentHSV;  // fade from wherever we are now
-      targetHSV = rgbToHsv((uint8_t)value[0], (uint8_t)value[1], (uint8_t)value[2]);
-
-      // Black, white and grey have no hue of their own: borrow it from the
-      // other end so fading to/from them doesn't sweep through the rainbow
-      if (targetHSV.s == 0 || targetHSV.v == 0) targetHSV.h = startHSV.h;
-      if (startHSV.s == 0 || startHSV.v == 0) startHSV.h = targetHSV.h;
-
-      // Shortest way around the hue circle
-      hueDelta = (int32_t)targetHSV.h - (int32_t)startHSV.h;
-      if (hueDelta > 32768) hueDelta -= 65536;
-      if (hueDelta < -32768) hueDelta += 65536;
-
-      transitionDuration = 0;
-      if (value.length() >= 5) {
-        transitionDuration = ((uint8_t)value[3] << 8) | (uint8_t)value[4];
-      }
-      transitionStart = millis();
+    // Payload: [pin, r, g, b] or [pin, r, g, b, durationHi, durationLo] (ms)
+    if (value.length() < 4 || !isStripPin((uint8_t)value[0])) return;
+    uint8_t pin = (uint8_t)value[0];
+    HSV target = rgbToHsv((uint8_t)value[1], (uint8_t)value[2], (uint8_t)value[3]);
+    unsigned long duration = 0;
+    if (value.length() >= 6) {
+      duration = ((uint8_t)value[4] << 8) | (uint8_t)value[5];
     }
+
+    portENTER_CRITICAL(&stateMux);
+    PinState &st = pinStates[pin];
+    st.startHSV = st.currentHSV;  // fade from wherever we are now
+    st.targetHSV = target;
+
+    // Black, white and grey have no hue of their own: borrow it from the
+    // other end so fading to/from them doesn't sweep through the rainbow
+    if (st.targetHSV.s == 0 || st.targetHSV.v == 0) st.targetHSV.h = st.startHSV.h;
+    if (st.startHSV.s == 0 || st.startHSV.v == 0) st.startHSV.h = st.targetHSV.h;
+
+    // Shortest way around the hue circle
+    st.hueDelta = (int32_t)st.targetHSV.h - (int32_t)st.startHSV.h;
+    if (st.hueDelta > 32768) st.hueDelta -= 65536;
+    if (st.hueDelta < -32768) st.hueDelta += 65536;
+
+    st.transitionDuration = duration;
+    st.transitionStart = millis();
+    portEXIT_CRITICAL(&stateMux);
   }
 };
 
@@ -121,9 +175,32 @@ class animationCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
     String value = pCharacteristic->getValue();
 
-    if (value.length() > 0) {
-      animation = (uint8_t)value[0];
+    // Payload: [pin, animation index]
+    if (value.length() < 2 || !isStripPin((uint8_t)value[0])) return;
+
+    portENTER_CRITICAL(&stateMux);
+    pinStates[(uint8_t)value[0]].animation = (uint8_t)value[1];
+    portEXIT_CRITICAL(&stateMux);
+  }
+};
+
+class stripsCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) {
+    String value = pCharacteristic->getValue();
+
+    // Payload: [pin, countHi, countLo] once per strip, in the page's order.
+    // Rebuilding the strips can't happen here (loop() might be drawing them),
+    // so the list is stored and loop() applies it.
+    size_t len = value.length();
+    if (len > sizeof(pendingConfig)) len = sizeof(pendingConfig);
+
+    portENTER_CRITICAL(&stateMux);
+    for (size_t i = 0; i < len; i++) {
+      pendingConfig[i] = (uint8_t)value[i];
     }
+    pendingConfigLen = len;
+    configPending = true;
+    portEXIT_CRITICAL(&stateMux);
   }
 };
 
@@ -131,35 +208,46 @@ void setup() {
   Serial.begin(115200);
 
   pinMode(ledPin, OUTPUT);
-  pixels.begin();
+
+  // Until the page sends its own list: one 64-LED strip on GPIO 27
+  const uint8_t defaultConfig[] = { 27, 0, 64 };
+  memcpy(pendingConfig, defaultConfig, sizeof(defaultConfig));
+  pendingConfigLen = sizeof(defaultConfig);
+  configPending = true;
+  applyPendingConfig();
 
   // Initialize BLE Device and give it a name
   BLEDevice::init(DEVICE_NAME);
 
   // Create Server and assign the callbacks
   pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new MyServerCallbacks());  // <-- ADDED
+  pServer->setCallbacks(new MyServerCallbacks());
 
   // Create Service
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
-  // Create Characteristic
+  // Create Characteristics
   BLECharacteristic *pCharacteristic = pService->createCharacteristic(
     CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
 
   BLECharacteristic *fillCharacteristic = pService->createCharacteristic(
-    "154f969f-5195-4552-9aba-85922a7ba713",
+    FILL_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
 
   BLECharacteristic *animationCharacteristic = pService->createCharacteristic(
-    "4a9163c8-45ae-42a9-a7d7-e26485ca83e7",
+    ANIMATION_CHARACTERISTIC_UUID,
     BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
 
-  // Assign the data callback
-  pCharacteristic->setCallbacks(new MyCallbacks());
+  BLECharacteristic *stripsCharacteristic = pService->createCharacteristic(
+    STRIPS_CHARACTERISTIC_UUID,
+    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+
+  // Assign the data callbacks
+  pCharacteristic->setCallbacks(new powerCallbacks());
   fillCharacteristic->setCallbacks(new fillCallbacks());
   animationCharacteristic->setCallbacks(new animationCallbacks());
+  stripsCharacteristic->setCallbacks(new stripsCallbacks());
 
   // Start Service
   pService->start();
@@ -179,24 +267,6 @@ void setup() {
 }
 
 void loop() {
-  updateColorTransition();
-  // The animations below read r/g/b, which is always the current (faded) color
-  uint8_t r = currentColor[0];
-  uint8_t g = currentColor[1];
-  uint8_t b = currentColor[2];
-
-  Serial.print(ledOn);
-  Serial.print("\t");
-  Serial.print(animation);
-  Serial.print("\t");
-  Serial.print(r);
-  Serial.print("\t");
-  Serial.print(g);
-  Serial.print("\t");
-  Serial.print(b);
-  Serial.println();
-
-
   // --- NEW CONNECTION MANAGEMENT LOGIC ---
 
   // If the device just disconnected
@@ -205,9 +275,6 @@ void loop() {
     pServer->startAdvertising();  // Restart advertising
     Serial.println("Restarting advertising... Ready for new connection.");
     oldDeviceConnected = deviceConnected;
-
-    // Optional: Turn off the LED when disconnected
-    // ledOn = false;
   }
 
   // If the device just connected
@@ -215,11 +282,40 @@ void loop() {
     oldDeviceConnected = deviceConnected;
   }
 
+  applyPendingConfig();
+
   // --- NEOPIXEL LOGIC ---
+  for (uint8_t i = 0; i < stripCount; i++) {
+    Adafruit_NeoPixel *px = strips[i];
+
+    // Advance the fade, then draw from a copy so the lock is held only briefly
+    portENTER_CRITICAL(&stateMux);
+    PinState &live = pinStates[px->getPin()];
+    updateColorTransition(live);
+    PinState st = live;
+    portEXIT_CRITICAL(&stateMux);
+
+    renderStrip(*px, st);
+  }
+
+  printStatus();
+
+  delay(16);  // Small delay to prevent watchdog issues
+}
+
+// Draws one frame of a strip's animation
+void renderStrip(Adafruit_NeoPixel &pixels, const PinState &st) {
+  const int numpixels = pixels.numPixels();
+
+  // The animations below read r/g/b, which is always the current (faded) color
+  uint8_t r = st.currentColor[0];
+  uint8_t g = st.currentColor[1];
+  uint8_t b = st.currentColor[2];
+
   pixels.clear();
 
-  if (ledOn) {
-    switch (animation) {
+  if (st.on) {
+    switch (st.animation) {
       case SOLID:
         for (int i = 0; i < numpixels; i++) {
           pixels.setPixelColor(i, pixels.Color(r, g, b));
@@ -250,27 +346,116 @@ void loop() {
   }
 
   pixels.show();
+}
 
-  delay(16);  // Small delay to prevent watchdog issues
+// Rebuilds the strips from the latest list sent by the page (if any).
+// Strips that keep the same pin and LED count are reused, so they don't flicker.
+void applyPendingConfig() {
+  uint8_t config[sizeof(pendingConfig)];
+  size_t len = 0;
+
+  portENTER_CRITICAL(&stateMux);
+  bool pending = configPending;
+  if (pending) {
+    len = pendingConfigLen;
+    memcpy(config, pendingConfig, len);
+    configPending = false;
+  }
+  portEXIT_CRITICAL(&stateMux);
+
+  if (!pending) return;
+
+  // 1. Switch off and free the strips that aren't in the new list. This must
+  //    happen before creating new ones: freeing a strip releases its pin.
+  for (uint8_t i = 0; i < stripCount; i++) {
+    bool keep = false;
+    for (size_t o = 0; o + 3 <= len; o += 3) {
+      uint16_t count = (config[o + 1] << 8) | config[o + 2];
+      if (strips[i]->getPin() == config[o] && strips[i]->numPixels() == count) keep = true;
+    }
+    if (!keep) {
+      strips[i]->clear();
+      strips[i]->show();
+      delete strips[i];
+      strips[i] = NULL;
+    }
+  }
+
+  // 2. Build the new list in the page's order, reusing the strips kept above
+  Adafruit_NeoPixel *next[MAX_STRIPS];
+  uint8_t nextCount = 0;
+
+  for (size_t o = 0; o + 3 <= len && nextCount < MAX_STRIPS; o += 3) {
+    uint8_t pin = config[o];
+    uint16_t count = (config[o + 1] << 8) | config[o + 2];
+    if (!isStripPin(pin) || count == 0 || count > MAX_LEDS_PER_STRIP) continue;
+
+    bool pinTaken = false;
+    for (uint8_t j = 0; j < nextCount; j++) {
+      if (next[j]->getPin() == pin) pinTaken = true;
+    }
+    if (pinTaken) continue;
+
+    Adafruit_NeoPixel *strip = NULL;
+    for (uint8_t i = 0; i < stripCount; i++) {
+      if (strips[i] && strips[i]->getPin() == pin && strips[i]->numPixels() == count) {
+        strip = strips[i];
+        strips[i] = NULL;
+      }
+    }
+    if (!strip) {
+      strip = new Adafruit_NeoPixel(count, pin, NEO_GRB + NEO_KHZ800);
+      strip->begin();
+    }
+    next[nextCount++] = strip;
+  }
+
+  memcpy(strips, next, sizeof(next[0]) * nextCount);
+  stripCount = nextCount;
+
+  Serial.print("Strips:");
+  for (uint8_t i = 0; i < stripCount; i++) {
+    Serial.printf(" GPIO%d x%d", strips[i]->getPin(), strips[i]->numPixels());
+  }
+  Serial.println();
+}
+
+// Prints every strip's state to the Serial Monitor a few times per second:
+// GPIO  on  animation  r  g  b
+void printStatus() {
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint < 250) return;
+  lastPrint = millis();
+
+  for (uint8_t i = 0; i < stripCount; i++) {
+    int pin = strips[i]->getPin();
+    portENTER_CRITICAL(&stateMux);
+    PinState st = pinStates[pin];
+    portEXIT_CRITICAL(&stateMux);
+
+    Serial.printf("GPIO%d\t%d\t%d\t%d\t%d\t%d\t| ", pin, st.on, st.animation,
+                  st.currentColor[0], st.currentColor[1], st.currentColor[2]);
+  }
+  Serial.println();
 }
 
 // Moves currentHSV along the startHSV -> targetHSV fade and rebuilds currentColor
-void updateColorTransition() {
+void updateColorTransition(PinState &st) {
   float t = 1.0f;
-  if (transitionDuration > 0) {
-    t = (float)(millis() - transitionStart) / (float)transitionDuration;
+  if (st.transitionDuration > 0) {
+    t = (float)(millis() - st.transitionStart) / (float)st.transitionDuration;
     if (t > 1.0f) t = 1.0f;
   }
 
-  currentHSV.h = (uint16_t)((int32_t)startHSV.h + (int32_t)(hueDelta * t));  // wraps naturally
-  currentHSV.s = (uint8_t)llerp(startHSV.s, targetHSV.s, t);
-  currentHSV.v = (uint8_t)llerp(startHSV.v, targetHSV.v, t);
+  st.currentHSV.h = (uint16_t)((int32_t)st.startHSV.h + (int32_t)(st.hueDelta * t));  // wraps naturally
+  st.currentHSV.s = (uint8_t)llerp(st.startHSV.s, st.targetHSV.s, t);
+  st.currentHSV.v = (uint8_t)llerp(st.startHSV.v, st.targetHSV.v, t);
 
   // ColorHSV packs 0x00RRGGBB; no gamma here, the animations apply their own
-  uint32_t c = pixels.ColorHSV(currentHSV.h, currentHSV.s, currentHSV.v);
-  currentColor[0] = (c >> 16) & 0xFF;
-  currentColor[1] = (c >> 8) & 0xFF;
-  currentColor[2] = c & 0xFF;
+  uint32_t c = Adafruit_NeoPixel::ColorHSV(st.currentHSV.h, st.currentHSV.s, st.currentHSV.v);
+  st.currentColor[0] = (c >> 16) & 0xFF;
+  st.currentColor[1] = (c >> 8) & 0xFF;
+  st.currentColor[2] = c & 0xFF;
 }
 
 // RGB (0..255) -> HSV with hue on the 0..65535 scale ColorHSV expects

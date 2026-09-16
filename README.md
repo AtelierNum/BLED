@@ -2,7 +2,7 @@
 template: true
 title: ESP32 <-BLE-> webpage
 thumbnail: thumbnail.jpg
-description: Control an LED strip from a webpage over Bluetooth, and design light sequences on a timeline with colors, fades and animations
+description: Control up to 6 LED strips from a webpage over Bluetooth, and design light sequences on a timeline with colors, fades and animations
 language: en
 tags:
   - esp32
@@ -21,13 +21,13 @@ _An ateliernum template_
 
 ## What does it do? ✨
 
-You plug an LED strip into a small board called an **ESP32**. Then you open a webpage in Chrome and control the lights **over Bluetooth**, with no cables between your computer and the lights.
+You plug one or more LED strips (up to 6) into a small board called an **ESP32**. Then you open a webpage in Chrome and control the lights **over Bluetooth**, with no cables between your computer and the lights.
 
 The webpage has three zones:
 
-- **Connection:** connect your computer to the board.
-- **Manual:** turn the lights on or off, pick a color and switch between animations in real time.
-- **Timeline:** design a light sequence, like a mini video editor for light. Place **keyframes** on a bar, give each one a color and an animation, and press **Play**. The lights fade smoothly from one color to the next.
+- **Setup:** connect your computer to the board and tell the page which strips you plugged in.
+- **Manual:** choose a strip, then turn it on or off, pick a color and switch between animations in real time.
+- **Timeline:** design a light sequence for each strip, like a mini video editor for light. Place **keyframes** on a bar, give each one a color and an animation, and press **Play**. The lights fade smoothly from one color to the next.
 
 Once you press Play, the board does the animating on its own. The webpage only tells it _"now switch to this"_ at each keyframe.
 
@@ -36,9 +36,9 @@ Once you press Play, the board does the animating on its own. The webpage only t
 | What | Notes |
 | --- | --- |
 | An **ESP32** board | The common "ESP32 DevKit" type is perfect |
-| A **NeoPixel LED strip** (WS2812B) | The code expects **64 LEDs**. You can change that, see [Make it yours](#make-it-yours-) |
+| 1 to 6 **NeoPixel LED strips** (WS2812B) | Any length. You enter the number of LEDs in the webpage |
 | A **USB cable** | Must be a _data_ cable. Some cheap cables only charge, and those won't work |
-| 3 **jumper wires** | To connect the strip to the board |
+| 3 **jumper wires** per strip | To connect each strip to the board |
 | A **computer with Chrome** | Or any Chromium browser: Edge, Brave, Arc… |
 | _(Optional)_ A **5V power supply** | For long strips or bright white light, see the warning below |
 
@@ -46,15 +46,20 @@ Once you press Play, the board does the animating on its own. The webpage only t
 
 ### Wiring
 
-The LED strip has 3 wires. Look for the little arrows or the **DIN** label on the strip, and connect the end where the arrows _start_.
+Each LED strip has 3 wires. Look for the little arrows or the **DIN** label on the strip, and connect the end where the arrows _start_.
 
 | LED strip | ESP32 |
 | --- | --- |
 | **5V** (often red) | **5V** or **VIN** |
 | **GND** (often white or black) | **GND** |
-| **DIN** / data (often green) | **GPIO 27** (sometimes labeled **D27** or just **27**) |
+| **DIN** / data (often green) | A **GPIO pin** of your choice from the list below. Pins are labeled with their number, sometimes with a **D** in front (**D27**) |
 
-> ⚡ **Power warning:** the strip gets its power from your computer's USB port, and USB can't give much. 64 LEDs at full white can ask for far more than that. The board may then keep restarting, or the colors may look wrong. If that happens, use darker colors, or power the strip from a separate 5V supply. In that case, **connect the supply's GND to the ESP32's GND too**. Ask the atelier team if you're unsure.
+**Pins you can use:** 4, 5, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33.
+Each strip needs **its own pin**. If you're not sure, start with **27**, the pin the page uses by default. The other pins on the board are busy with other jobs, which is why the page doesn't offer them.
+
+With several strips, all the **5V** wires go to 5V and all the **GND** wires go to GND. Only the data wires go to different pins.
+
+> ⚡ **Power warning:** the strips get their power from your computer's USB port, and USB can't give much. A single strip of 64 LEDs at full white can already ask for far more than that. The board may then keep restarting, or the colors may look wrong. If that happens, use darker colors, or power the strip from a separate 5V supply. In that case, **connect the supply's GND to the ESP32's GND too**. Ask the atelier team if you're unsure.
 
 ## What software do I need? 🌈 📂
 
@@ -88,18 +93,24 @@ Open `index.html` in **Chrome**. You can drag the file into a Chrome window.
 
 ### Step 3: connect and play
 
-1. Click **Connect to ESP32**. A Chrome popup lists nearby devices. Pick **ESP32_BLE_Trigger** and click **Pair**.
-2. When the status says **Connected!**, all the buttons unlock.
-3. **Try the Manual zone:**
-   - Click **Trigger: ON** to turn the lights on.
+1. **List your strips in the Setup zone**, under **Strips**. There's one row per strip:
+   - **GPIO:** the pin the strip's data wire is plugged into.
+   - **LEDs:** how many LEDs the strip has. Count them, or check the product page.
+   - Click **+ Add strip** for each extra strip, and **✕** to remove one.
+2. Click **Connect to ESP32**. A Chrome popup lists nearby devices. Pick **ESP32_BLE_Trigger** and click **Pair**.
+3. When the status says **Connected!**, all the buttons unlock. You can still change the strip list after connecting.
+4. **Try the Manual zone:**
+   - At the top, click the button of the strip you want to control, for example **GPIO 27**. The controls below only affect that strip.
+   - Click **ON** to turn it on.
    - Pick a color. **Fade (ms)** sets how long the fade to the new color takes: `1000` = 1 second, `0` = instant.
    - Click an animation name to switch to it.
-4. **Build a sequence in the Timeline zone:**
+5. **Build a sequence in the Timeline zone.** Each strip has its own timeline, labeled with its pin:
    - Set the **Length** in seconds.
    - **Click on the colored bar** to add a keyframe. Each keyframe gets its own row below, where you can change its time, color and animation, or delete it with ✕.
    - The colored bar shows your sequence. Each block fades from one keyframe's color to the next.
    - Your sequence always has a **start** and an **end** keyframe. You can change their colors, but you can't move or delete them.
-   - Press **Play**. The lights turn on and follow your sequence. Tick **Loop** to make it repeat.
+   - Press **Play**. The strip turns on and follows your sequence. Tick **Loop** to make it repeat.
+   - Each timeline plays on its own: press **Play** on each strip you want to run.
 
 ### The animations
 
@@ -112,14 +123,14 @@ Open `index.html` in **Chrome**. You can drag the file into a Chrome window.
 
 ## Make it yours 🔩 🔨
 
-All of these changes are in `ESP32_webBLE.ino`. Upload the code again after each change.
+The number of strips, their pins and their number of LEDs are all set in the webpage (see Step 3), so you don't need to touch the code for those.
 
-- **A different number of LEDs:** change `64` in the line `const unsigned int numpixels = 64;`.
-- **A different data pin:** change `27` in the line `Adafruit_NeoPixel pixels(numpixels, 27, …)`.
+These changes are in the code. Upload the code again after each change.
+
 - **Several boards in the same room (important in class!):** by default every board is called `ESP32_BLE_Trigger`, so you won't know which one is yours in the popup. Give yours a unique name like `ESP32_Lea`. Change it in **both** files, or the page won't find your board:
   - `ESP32_webBLE.ino`: `#define DEVICE_NAME "ESP32_BLE_Trigger"`
   - `index.html`: `filters: [{ name: "ESP32_BLE_Trigger" }]`
-- **Create your own animation:** in the `.ino` file, look at the `switch (animation)` block inside `loop()` to see how the existing animations are made. A new animation needs changes in both files, so ask the atelier team or an AI assistant for help. The `agent.md` file in this folder explains the project to AI assistants.
+- **Create your own animation:** in the `.ino` file, look at the `switch (st.animation)` block inside `renderStrip()` to see how the existing animations are made. A new animation needs changes in both files, so ask the atelier team or an AI assistant for help. The `agent.md` file in this folder explains the project to AI assistants.
 
 ## Be careful ⚠️
 
@@ -135,6 +146,8 @@ All of these changes are in `ESP32_webBLE.ino`. Upload the code again after each
 | The board doesn't show up in the Arduino IDE port list | Try another USB cable (yours may be charge-only) or another USB port. On Windows, you may need the **CP210x** or **CH340** driver. Search for the name printed on the small chip next to the USB port |
 | The upload fails with `Connecting......_____` | Hold the **BOOT** button during the upload |
 | My board isn't in the Chrome popup | Make sure Bluetooth is on and the upload finished. Unplug the board and plug it back in. Check that nobody else is connected to it |
-| Connected, but the lights stay off | Click **Trigger: ON** or press **Play**. Check the 3 wires, and make sure DIN is on the right end of the strip (where the arrows start) |
+| Connected, but the lights stay off | Click **ON** or press **Play**. In **Setup**, check that the strip's **GPIO** matches the pin its data wire is plugged into. Check the 3 wires, and make sure DIN is on the right end of the strip (where the arrows start) |
+| I clicked ON but the wrong strip lit up | In the **Manual** zone, first click the button of the strip you want (for example **GPIO 27**), then use the controls |
+| Only part of the strip lights up | In **Setup**, set **LEDs** to the real number of LEDs on that strip |
 | The lights flicker, the colors are wrong or the board keeps restarting | Not enough power: use darker colors or an external 5V supply |
 | The status says **Disconnected** out of nowhere | Move closer to the board, then click **Connect** again |
