@@ -29,6 +29,8 @@ The webpage has three zones:
 - **Manual:** choose a strip, then turn it on or off, pick a color and switch between animations in real time.
 - **Timeline:** design a light sequence for each strip, like a mini video editor for light. Place **keyframes** on a bar, give each one a color and an animation, and press **Play**. The lights fade smoothly from one color to the next.
 
+Three small buttons in the top right corner let you **copy, save and load** a whole setup, so you don't lose your work when you close the page.
+
 Once you press Play, the board does the animating on its own. The webpage only tells it _"now switch to this"_ at each keyframe.
 
 ## What hardware do I need? 💾 🔌
@@ -111,6 +113,16 @@ Open `index.html` in **Chrome**. You can drag the file into a Chrome window.
    - Your sequence always has a **start** and an **end** keyframe. You can change their colors, but you can't move or delete them.
    - Press **Play**. The strip turns on and follows your sequence. Tick **Loop** to make it repeat.
    - Each timeline plays on its own: press **Play** on each strip you want to run.
+
+### Step 4: keep your work
+
+The page forgets everything when you close or reload it. The three small buttons in the **top right corner** let you keep a setup, with your strips, colors and timelines:
+
+- **Copy** puts the whole setup in your clipboard, as text. Handy to paste it in a message or a note.
+- **Save** downloads it as a file called `bled-setup.json`. Keep it next to your project files.
+- **Load** opens a window with three ways to bring a setup back: **drag and drop** a saved file onto it, click **Choose file** to pick one, or **paste** a setup you copied. Then click **Load**: the page rebuilds everything, and if you're connected, the strips follow right away.
+
+> 💡 You can open the `.json` file in a text editor to see what's inside, and even hand it to a classmate so they get your exact light design.
 
 ### The animations
 

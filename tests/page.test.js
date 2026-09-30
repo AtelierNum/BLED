@@ -162,6 +162,83 @@ const take = async () => { await flush(); return writes.splice(0); };
   check("capped at 6 strips, add disabled", $$(".stripRow").length === 6 && $("#addStripBtn").disabled);
   await take();
 
+  // --- config: serialize / load ---
+  const saved = JSON.parse(w.eval("serializeConfig()"));
+  check("serialize: version, fade and every strip", saved.bled === 1 && saved.fade === 500 && saved.strips.length === 6);
+  check("serialize: a strip carries pin, count, color, anim and its timeline", JSON.stringify(saved.strips[0]) === JSON.stringify({
+    pin: 27, count: 64, color: "#007800", anim: 0,
+    timeline: {
+      length: 10, loop: false,
+      keyframes: [
+        { time: 0, anim: 0, color: "#007800", fixed: "start" },
+        { time: 10, anim: 0, color: "#007800", fixed: "end" },
+      ],
+    },
+  }));
+
+  $("#cfgLoadBtn").click();
+  check("load: modal opens empty", $("#cfgModal").classList.contains("open") && $("#cfgText").value === "");
+  $("#cfgText").value = JSON.stringify({
+    bled: 1,
+    fade: 250,
+    strips: [
+      {
+        pin: 14, count: 30, color: "#ff0000", anim: 2,
+        timeline: {
+          length: 4, loop: true,
+          keyframes: [
+            { time: 0, anim: 1, color: "#000000", fixed: "start" },
+            { time: 2, anim: 3, color: "#00ff00" },
+            { time: 9, anim: 0, color: "#123456" }, // past the end: dropped
+            { time: 4, anim: 0, color: "#0000ff", fixed: "end" },
+          ],
+        },
+      },
+      { pin: 99, count: 5000 }, // unknown pin -> first free one, count clamped
+      { pin: 14, count: 10 }, // duplicate pin -> dropped
+    ],
+  });
+  $("#cfgApplyBtn").click();
+  wr = await take();
+  check("load: modal closes", !$("#cfgModal").classList.contains("open"));
+  check("load: bad pin fixed up, duplicate dropped", w.eval("strips.map((s) => s.pin).join()") === "14,4");
+  check("load: all three zones redrawn, first strip selected", $$(".stripRow").length === 2 && $$(".track").length === 2 && $$("#stripTabs button")[0].classList.contains("selected"));
+  check("load: fade applied", $("#fade").value === "250");
+  check("load: timeline length, loop and keyframes", w.eval("JSON.stringify(stripById(strips[0].id).tl.keyframes.map((k) => [k.time, k.anim, k.color, k.fixed || null]))") === JSON.stringify([[0, 1, "#000000", "start"], [2, 3, "#00ff00", null], [4, 0, "#0000ff", "end"]]) && w.eval("strips[0].tl.length") === 4 && w.eval("strips[0].tl.loop") === true);
+  check("load: defaults for the strip the file left blank", w.eval("strips[1].count") === 1000 && w.eval("strips[1].color") === "#007800" && w.eval("strips[1].tl.length") === 10);
+  check("load: new strip list sent", JSON.stringify(wr.find((x) => x[0] === "strips")) === JSON.stringify(["strips", [14, 0, 30, 4, 3, 232]]));
+  check("load: each strip's color and animation replayed", JSON.stringify(wr.slice(-4)) === JSON.stringify([
+    ["fill", [14, 255, 0, 0, 0, 0]],
+    ["anim", [14, 2]],
+    ["fill", [4, 0, 120, 0, 0, 0]],
+    ["anim", [4, 0]],
+  ]));
+  check("load: dropped pins switched off", wr.filter((x) => x[0] === "power").every((x) => x[1][1] === 0) && wr.some((x) => JSON.stringify(x) === JSON.stringify(["power", [27, 0]])));
+
+  // a setup that can't be read leaves the page alone and says so
+  $("#cfgLoadBtn").click();
+  $("#cfgText").value = "{ not json";
+  $("#cfgApplyBtn").click();
+  await flush();
+  check("bad setup: modal stays open with a message, strips untouched", $("#cfgModal").classList.contains("open") && $("#cfgMsg").textContent.startsWith("Couldn't read") && w.eval("strips.length") === 2);
+  $("#cfgText").value = JSON.stringify({ bled: 1, strips: [] });
+  $("#cfgApplyBtn").click();
+  await flush();
+  check("empty setup: refused", $("#cfgModal").classList.contains("open") && w.eval("strips.length") === 2);
+  $("#cfgCancelBtn").click();
+  check("cancel closes the modal", !$("#cfgModal").classList.contains("open"));
+  await take();
+
+  // a file (dropped or picked with the file button) fills the textarea
+  $("#cfgLoadBtn").click();
+  check("file button sits in the drop zone and asks for json", $("#cfgDrop input[type=file]") === $("#cfgFile") && $("#cfgFile").accept.includes("json"));
+  const fileText = JSON.stringify({ bled: 1, strips: [{ pin: 22, count: 12 }] });
+  await w.eval(`readConfigFile({ text: async () => ${JSON.stringify(fileText)} })`);
+  check("file lands in the textarea instead of loading straight away", $("#cfgText").value === fileText && w.eval("strips.length") === 2);
+  $("#cfgApplyBtn").click();
+  await take();
+  check("loading the file's setup applies it", w.eval("strips.map((s) => [s.pin, s.count]).join()") === "22,12");
+
   console.log(failures ? `\n${failures} FAILED` : "\nall passed");
   process.exit(failures ? 1 : 0);
 })();

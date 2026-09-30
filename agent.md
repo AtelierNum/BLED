@@ -74,10 +74,11 @@ All characteristics are `READ | WRITE`. The page only writes to them and never r
 - It only works in **Chromium and Google Chrome**, on a secure context (`https://` or `localhost`). Web Bluetooth needs a user gesture, so the connection has to start from the "Connect" button click.
 - The page is plain vanilla JS with no framework and no bundler. Keep it that way unless asked otherwise.
 - Only one client can connect to the ESP32 at a time.
-- The UI has three zones:
+- The UI has three zones, plus a fixed cluster of config buttons in the top right corner:
   - **Setup:** the connect button, the status line, and the strip list (`renderStripList`).
   - **Manual:** the strip selector buttons (`renderStripTabs`), on/off, the animation buttons, and color + fade.
   - **Timeline:** one track per strip (`renderTracks` / `renderTrack`).
+  - **Config (`#cfgButtons`):** Copy / Save / Load, see [Setup config](#setup-config).
 - **Strips model:** `strips` is an array of objects created by `createStrip(pin, count)`. Each one holds:
   - `id`, the page-side identity (the ESP32 only sees `pin`),
   - `pin` and `count`,
@@ -107,12 +108,22 @@ All characteristics are `READ | WRITE`. The page only writes to them and never r
     - When segment *i* begins, the page sends `sendFill(strip, keyframes[i+1].color, segmentDuration, keyframes[i].color)` and `sendAnim(strip, keyframes[i].anim)`. That's two writes per segment. The ESP32 renders the animation and the fade itself; nothing is streamed.
     - At the end, the track loops if `tl.loop` is set, otherwise it stops.
 
+### Setup config
+
+The whole page state can be serialized to JSON, so a setup survives a reload. Nothing is stored on the ESP32 and nothing is persisted automatically: it's copy / download / load by hand.
+
+- **Format** (`serializeConfig`): `{ bled: 1, fade, strips: [{ pin, count, color, anim, timeline: { length, loop, keyframes: [{ time, anim, color, fixed? }] } }] }`. `bled` is `CONFIG_VERSION`; bump it if the shape changes incompatibly. Transient state (`on`, `playing`, `start`, `next`, and the page-side `id`s) is deliberately left out.
+- **Buttons** (`#cfgButtons`, fixed top right): **Copy** (clipboard, with a `document.execCommand` fallback for non-secure contexts), **Save** (`bled-setup.json` via a Blob URL), **Load** (opens `#cfgModal`).
+- **Modal** (`#cfgModal`, shown with the `open` class): a drop zone with a file input (`#cfgFile`) inside it, and a textarea. A file's text lands in the textarea (`readConfigFile`, shared by the drop handler and the input's `change`) rather than loading straight away, so it can still be read and edited. Opening the modal clears the file input, so picking the same file twice still fires `change`. Escape, the Cancel button or a click on the backdrop closes it.
+- **`applyConfig(text)` repairs instead of refusing.** Unknown pins get the first free one, duplicate pins and strips past `MAX_STRIPS` are dropped, counts and animation indexes are clamped, and `keyframesFromConfig` always rebuilds the two pinned keyframes so the rest of the page can still rely on them (keyframes at or past `length` are dropped). It only throws when there's nothing usable, and the modal then shows the message and leaves the page untouched.
+- After loading it stops every track, switches off the pins that are no longer used, re-renders all three zones, sends the new strip list, then re-sends each strip's color and animation. It never powers a strip on.
+
 ## Running
 
 - **Web:** serve `index.html` with any static server, for example `npx serve` or `python -m http.server`, or host it on GitHub Pages. Then open it in Chrome.
 - **Firmware:** open `ESP32_webBLE/ESP32_webBLE.ino` in Arduino IDE with the ESP32 board package and the Adafruit NeoPixel library installed, then upload it to the board.
 - **Tests** (`tests/`, Node + jsdom, no browser or board needed). Run `npm test` from `tests/`. It has two files:
-  - `page.test.js` loads `index.html` with a fake `navigator.bluetooth` that records every byte written to each characteristic. It then drives the UI (strip list, manual tabs, timelines, Play / Play all) and checks the exact payloads.
+  - `page.test.js` loads `index.html` with a fake `navigator.bluetooth` that records every byte written to each characteristic. It then drives the UI (strip list, manual tabs, timelines, Play / Play all, and the setup config modal) and checks the exact payloads. The config tests run last, and they replace the strip list, so add new tests before them or expect a different state.
   - `color.test.js` records the fill writes the page sends while playing a timeline and delivers them 20–60 ms late, like real BLE. It replays them through a **JS port of the firmware's color code** (`fillCallbacks`, `updateColorTransition`, `rgbToHsv`, `ColorHSV`) and checks the pixel colors frame by frame: exact green/black/magenta thirds, and fades through black that don't wash out. **If you change the firmware's color logic, update the port too**, or this test no longer means anything.
   - The repo lives in a Google Drive-synced folder, so avoid `npm install` inside it (`node_modules` would sync). Install jsdom somewhere outside the repo and point Node at it instead, e.g. `$env:NODE_PATH = "<dir>\node_modules"; node page.test.js; node color.test.js`.
   - After changing a test's expectations, check that the test still fails on the bug it guards (for example, temporarily revert the fix).

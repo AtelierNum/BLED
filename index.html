@@ -165,9 +165,123 @@
         font-size: 13px;
         margin: 0;
       }
+      /* Config cluster, pinned to the top right corner of the page */
+      #cfgButtons {
+        position: fixed;
+        top: 10px;
+        right: 10px;
+        display: flex;
+        gap: 6px;
+        z-index: 10;
+      }
+      #cfgButtons button {
+        padding: 8px 12px;
+        font-size: 14px;
+        margin: 0;
+        background: #fff;
+        color: #333;
+        border: 1px solid #ccc;
+        box-shadow: 0 1px 3px rgba(0, 0, 0, 0.15);
+      }
+      #cfgButtons button:hover {
+        background: #007bff;
+        color: white;
+        border-color: #007bff;
+      }
+      #cfgModal {
+        display: none;
+        position: fixed;
+        inset: 0;
+        z-index: 20;
+        background: rgba(0, 0, 0, 0.4);
+        justify-content: center;
+        align-items: center;
+      }
+      #cfgModal.open {
+        display: flex;
+      }
+      #cfgDialog {
+        width: min(560px, 90vw);
+        padding: 20px;
+        border-radius: 8px;
+        background: #fff;
+        text-align: left;
+      }
+      #cfgDialog h2 {
+        margin: 0 0 15px;
+        font-size: 18px;
+        color: #333;
+      }
+      #cfgDrop {
+        padding: 20px 25px;
+        margin-bottom: 10px;
+        border: 2px dashed #ccc;
+        border-radius: 8px;
+        text-align: center;
+        color: #888;
+        font-size: 14px;
+      }
+      #cfgFile {
+        margin-top: 12px;
+        font-size: 13px;
+        color: #333;
+      }
+      #cfgDialog.dragging #cfgDrop {
+        border-color: #007bff;
+        color: #007bff;
+        background: #f0f7ff;
+      }
+      #cfgText {
+        width: 100%;
+        box-sizing: border-box;
+        height: 140px;
+        font-family: monospace;
+        font-size: 12px;
+        padding: 8px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+        resize: vertical;
+      }
+      #cfgMsg {
+        min-height: 18px;
+        margin: 8px 0;
+        font-size: 13px;
+        color: #dc3545;
+      }
+      #cfgDialog button {
+        padding: 8px 16px;
+        font-size: 15px;
+        margin: 0 8px 0 0;
+      }
+      #cfgApplyBtn {
+        background: #007bff;
+        color: white;
+      }
     </style>
   </head>
   <body>
+    <div id="cfgButtons">
+      <button id="cfgCopyBtn" title="Copy this setup to the clipboard">Copy</button>
+      <button id="cfgSaveBtn" title="Download this setup as a file">Save</button>
+      <button id="cfgLoadBtn" title="Load a setup">Load</button>
+    </div>
+
+    <div id="cfgModal">
+      <div id="cfgDialog">
+        <h2>Load a setup</h2>
+        <div id="cfgDrop">
+          Drop a <code>.json</code> setup file here
+          <div><input type="file" id="cfgFile" accept=".json,application/json" /></div>
+        </div>
+        <textarea id="cfgText" placeholder="…or paste a setup here"></textarea>
+        <p id="cfgMsg"></p>
+        <div>
+          <button id="cfgApplyBtn">Load</button>
+          <button id="cfgCancelBtn">Cancel</button>
+        </div>
+      </div>
+    </div>
+
     <h1>BLED</h1>
 
     <div id="connection" class="zone">
@@ -805,6 +919,241 @@
 
         setHead(strip, elapsed / tl.length);
       }
+
+      // --- CONFIG ---
+      // The whole setup (strips and their timelines) as JSON, so it can be
+      // copied, saved to a file and loaded back later. Nothing is stored on
+      // the ESP32: loading a setup just replays it over BLE.
+      const CONFIG_VERSION = 1;
+
+      function serializeConfig() {
+        return JSON.stringify(
+          {
+            bled: CONFIG_VERSION,
+            fade: parseInt(fadeInput.value) || 0,
+            strips: strips.map((s) => ({
+              pin: s.pin,
+              count: s.count,
+              color: s.color,
+              anim: s.anim,
+              timeline: {
+                length: s.tl.length,
+                loop: s.tl.loop,
+                keyframes: s.tl.keyframes.map((k) => ({
+                  time: k.time,
+                  anim: k.anim,
+                  color: k.color,
+                  ...(k.fixed ? { fixed: k.fixed } : {}),
+                })),
+              },
+            })),
+          },
+          null,
+          2,
+        );
+      }
+
+      const isHexColor = (c) => typeof c === "string" && /^#[0-9a-f]{6}$/i.test(c);
+      const clampAnim = (v) =>
+        Math.min(animations.length - 1, Math.max(0, parseInt(v) || 0));
+
+      // Rebuilds one track's keyframes from a config, keeping the two pinned
+      // ones: whatever the file says, a track always starts at 0 s and ends at
+      // `length`, so the rest of the page can rely on that
+      function keyframesFromConfig(raw, length) {
+        const list = (Array.isArray(raw) ? raw : [])
+          .filter((k) => k && isHexColor(k.color) && Number.isFinite(Number(k.time)))
+          .map((k) => ({
+            time: Math.min(length, Math.max(0, Number(k.time))),
+            anim: clampAnim(k.anim),
+            color: k.color.toLowerCase(),
+            fixed: k.fixed === "start" || k.fixed === "end" ? k.fixed : null,
+          }));
+        const first = list.find((k) => k.fixed === "start") || list[0];
+        const last = [...list].reverse().find((k) => k.fixed === "end") || list.at(-1);
+        return [
+          {
+            id: nextKeyId++,
+            time: 0,
+            anim: first ? first.anim : 0,
+            color: first ? first.color : "#007800",
+            fixed: "start",
+          },
+          ...list
+            .filter(
+              (k) => !k.fixed && k !== first && k !== last && k.time > 0 && k.time < length,
+            )
+            .map((k) => ({ id: nextKeyId++, time: k.time, anim: k.anim, color: k.color })),
+          {
+            id: nextKeyId++,
+            time: length,
+            anim: 0,
+            color: last ? last.color : "#007800",
+            fixed: "end",
+          },
+        ];
+      }
+
+      // Replaces the current setup. Anything the file gets wrong is fixed up
+      // rather than refused: unknown pins get a free one, duplicates and extra
+      // strips are dropped, numbers are clamped. Throws if there's nothing usable.
+      function applyConfig(text) {
+        const data = JSON.parse(text);
+        if (!data || !Array.isArray(data.strips) || data.strips.length === 0) {
+          throw new Error("no strips in this setup");
+        }
+
+        const built = [];
+        for (const raw of data.strips) {
+          if (built.length >= MAX_STRIPS) break;
+          if (!raw) continue;
+          const taken = (p) => built.some((s) => s.pin === p);
+          let pin = raw.pin;
+          if (!STRIP_PINS.includes(pin)) pin = STRIP_PINS.find((p) => !taken(p));
+          if (pin === undefined || taken(pin)) continue;
+
+          const count = Math.min(
+            MAX_LEDS_PER_STRIP,
+            Math.max(1, parseInt(raw.count) || 1),
+          );
+          const strip = createStrip(pin, count);
+          if (isHexColor(raw.color)) strip.color = raw.color.toLowerCase();
+          strip.anim = clampAnim(raw.anim);
+
+          const tl = raw.timeline || {};
+          strip.tl.length = Math.max(1, parseFloat(tl.length) || 10);
+          strip.tl.loop = !!tl.loop;
+          strip.tl.keyframes = keyframesFromConfig(tl.keyframes, strip.tl.length);
+          built.push(strip);
+        }
+        if (built.length === 0) throw new Error("no usable strip in this setup");
+
+        strips.forEach((s) => stopTrack(s.id));
+        // Switch off the pins we're about to forget, so none stays lit
+        const keptPins = built.map((s) => s.pin);
+        strips
+          .filter((s) => !keptPins.includes(s.pin))
+          .forEach((s) => queueWrite(characteristic, [s.pin, 0]));
+
+        strips = built;
+        if (Number.isFinite(Number(data.fade))) {
+          fadeInput.value = Math.max(0, Math.round(Number(data.fade)));
+        }
+        renderAllStrips();
+        selectStrip(strips[0].id);
+        sendStripConfig();
+        // Put each strip back in the state the setup describes
+        strips.forEach((s) => {
+          sendFill(s, s.color, 0);
+          sendAnim(s, s.anim);
+        });
+      }
+
+      // --- CONFIG BUTTONS ---
+      const cfgModal = document.getElementById("cfgModal");
+      const cfgDialog = document.getElementById("cfgDialog");
+      const cfgText = document.getElementById("cfgText");
+      const cfgMsg = document.getElementById("cfgMsg");
+      const cfgFile = document.getElementById("cfgFile");
+
+      // navigator.clipboard needs a secure context; fall back to a hidden textarea
+      async function copyToClipboard(text) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return true;
+        } catch (error) {
+          console.log(error);
+        }
+        const helper = document.createElement("textarea");
+        helper.value = text;
+        document.body.appendChild(helper);
+        helper.select();
+        let ok = false;
+        try {
+          ok = document.execCommand("copy");
+        } catch (error) {
+          console.log(error);
+        }
+        helper.remove();
+        return ok;
+      }
+
+      document.getElementById("cfgCopyBtn").addEventListener("click", async (ev) => {
+        const btn = ev.currentTarget;
+        const ok = await copyToClipboard(serializeConfig());
+        btn.textContent = ok ? "Copied!" : "Failed";
+        setTimeout(() => (btn.textContent = "Copy"), 1500);
+      });
+
+      document.getElementById("cfgSaveBtn").addEventListener("click", () => {
+        const blob = new Blob([serializeConfig()], { type: "application/json" });
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = "bled-setup.json";
+        link.click();
+        URL.revokeObjectURL(url);
+      });
+
+      function openConfigModal() {
+        cfgText.value = "";
+        cfgMsg.textContent = "";
+        cfgFile.value = ""; // so picking the same file again still fires `change`
+        cfgModal.classList.add("open");
+        cfgText.focus();
+      }
+
+      function closeConfigModal() {
+        cfgModal.classList.remove("open");
+        cfgDialog.classList.remove("dragging");
+      }
+
+      document.getElementById("cfgLoadBtn").addEventListener("click", openConfigModal);
+      document.getElementById("cfgCancelBtn").addEventListener("click", closeConfigModal);
+      // Click outside the dialog, or Escape, closes the modal
+      cfgModal.addEventListener("click", (ev) => {
+        if (ev.target === cfgModal) closeConfigModal();
+      });
+      document.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape") closeConfigModal();
+      });
+
+      document.getElementById("cfgApplyBtn").addEventListener("click", () => {
+        try {
+          applyConfig(cfgText.value);
+          closeConfigModal();
+        } catch (error) {
+          console.log(error);
+          cfgMsg.textContent = "Couldn't read that setup: " + error.message;
+        }
+      });
+
+      // A file lands in the textarea, whether it was dropped or picked with the
+      // file button, so it can still be checked (and edited) before loading
+      async function readConfigFile(file) {
+        if (!file) return;
+        cfgText.value = await file.text();
+        cfgMsg.textContent = "";
+      }
+
+      cfgFile.addEventListener("change", () => readConfigFile(cfgFile.files[0]));
+
+      cfgDialog.addEventListener("dragover", (ev) => {
+        ev.preventDefault();
+        cfgDialog.classList.add("dragging");
+      });
+      cfgDialog.addEventListener("dragleave", (ev) => {
+        // Moving over a child fires dragleave too, so only react when the
+        // pointer really left the dialog
+        if (!cfgDialog.contains(ev.relatedTarget)) {
+          cfgDialog.classList.remove("dragging");
+        }
+      });
+      cfgDialog.addEventListener("drop", (ev) => {
+        ev.preventDefault();
+        cfgDialog.classList.remove("dragging");
+        readConfigFile(ev.dataTransfer.files[0]);
+      });
 
       // Start with one 64-LED strip on GPIO 27, same as the ESP32's default
       strips.push(createStrip(27, 64));
